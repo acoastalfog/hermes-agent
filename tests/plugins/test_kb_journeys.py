@@ -107,7 +107,17 @@ def test_kb_command_renders_attention_cockpit_with_native_adapter(monkeypatch):
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    assert ctx.calls == [("mcp_kb_engine_prod_attention_cockpit", {})]
+    assert ctx.calls == [
+        (
+            "mcp_kb_engine_prod_attention_cockpit",
+            {
+                "attention_limit": 5,
+                "include_publication": True,
+                "include_readiness": True,
+                "run_limit": 3,
+            },
+        )
+    ]
     assert adapter.sent
     text = adapter.sent[0]["text"]
     assert "KB Today" in text
@@ -116,6 +126,46 @@ def test_kb_command_renders_attention_cockpit_with_native_adapter(monkeypatch):
     assert "Review 3 proposals" in text
     assert adapter.sent[0]["actions"] == []
     assert adapter.sent[0]["reply_to"] == "m1"
+
+
+def test_kb_command_renders_live_attention_summary_shape(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_attention_cockpit": {
+                "result": {
+                    "summary": {
+                        "active_todo_count": 309,
+                        "publication_status": "dirty",
+                        "queue_item_count": 309,
+                        "readiness_status": "degraded",
+                        "recent_run_count": 5,
+                    },
+                    "sections": {
+                        "publication": {
+                            "summary": {"ok": True, "status": "dirty"},
+                            "payload": {"git": {"changed_count": 106}},
+                        },
+                        "readiness": {"summary": {"ready": True, "status": "degraded"}},
+                    },
+                    "next_actions": ["Review prioritized queue items through workbench.queue."],
+                }
+            }
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    text = adapter.sent[0]["text"]
+    assert "Readiness: degraded" in text
+    assert "Publication: dirty" in text
+    assert "Queue: 309" in text
 
 
 def test_queue_command_uses_real_queue_summary_and_preview_then_confirm(monkeypatch):
@@ -378,3 +428,25 @@ def test_status_reports_noc_lane_and_reasoning(monkeypatch):
     assert "Environment: staging-dev" in card["text"]
     assert "Reasoning: xhigh" in card["text"]
     assert "responses" in card["text"]
+
+
+def test_status_reports_live_attention_summary_shape(monkeypatch):
+    from plugins.kb_journeys import _render_status
+
+    monkeypatch.setenv("HERMES_KB_MODE", "prod")
+    monkeypatch.setenv("HERMES_ENVIRONMENT", "production")
+    monkeypatch.setenv("HERMES_KB_WORKSPACE", "/home/abcosta/Knowledge/kb-anthony")
+
+    card = _render_status(
+        {
+            "summary": {"publication_status": "dirty", "readiness_status": "degraded"},
+            "sections": {
+                "publication": {"summary": {"status": "dirty"}},
+                "readiness": {"summary": {"status": "degraded"}},
+            },
+        },
+        "kb_engine_prod",
+    )
+
+    assert "Readiness: degraded" in card["text"]
+    assert "Publication: dirty" in card["text"]

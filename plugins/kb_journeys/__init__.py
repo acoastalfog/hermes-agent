@@ -131,6 +131,28 @@ def _count_from(data: Any, *keys: str) -> Any:
     return None
 
 
+def _readiness_status(data: dict[str, Any]) -> Any:
+    return (
+        _get_path(data, "summary", "readiness_status")
+        or _get_path(data, "sections", "readiness", "summary", "status")
+        or _get_path(data, "sections", "readiness", "payload", "status")
+        or _get_path(data, "readiness", "status")
+        or _get_path(data, "readiness", "state")
+        or data.get("readiness")
+    )
+
+
+def _publication_status(data: dict[str, Any]) -> Any:
+    return (
+        _get_path(data, "summary", "publication_status")
+        or _get_path(data, "sections", "publication", "summary", "status")
+        or _get_path(data, "sections", "publication", "payload", "status")
+        or _get_path(data, "publication", "status")
+        or _get_path(data, "publication", "state")
+        or data.get("publication")
+    )
+
+
 def _item_title(item: Any) -> str:
     if isinstance(item, dict):
         return _short(
@@ -180,18 +202,17 @@ def _render_today(data: Any) -> dict[str, Any]:
         text = f"KB Today\n{_short(data, 'No cockpit details returned.')}"
         return {"title": "KB Today", "text": text, "actions": []}
 
-    readiness = _short(
-        _get_path(data, "readiness", "status")
-        or _get_path(data, "readiness", "state")
-        or data.get("readiness")
-    )
-    publication = _short(
-        _get_path(data, "publication", "status")
-        or _get_path(data, "publication", "state")
-        or data.get("publication")
-    )
+    readiness = _short(_readiness_status(data))
+    publication = _short(_publication_status(data))
     queue_count = _count_from(data, "queue", "queues", "proposals")
+    if queue_count is None:
+        queue_count = _get_path(data, "summary", "queue_item_count")
     todo_count = _count_from(data, "todo", "todos")
+    if todo_count is None:
+        todo_count = (
+            _get_path(data, "summary", "active_todo_count")
+            or _get_path(data, "summary", "triage_todo_count")
+        )
 
     active_runs = _items(data, ("runs", "active"), ("active_runs",))
     recent_runs = _items(data, ("runs", "recent"), ("recent_runs",))
@@ -289,16 +310,8 @@ def _render_status(data: Any, target: str) -> dict[str, Any]:
     readiness = "unknown"
     publication = "unknown"
     if isinstance(data, dict):
-        readiness = _short(
-            _get_path(data, "readiness", "status")
-            or _get_path(data, "readiness", "state")
-            or data.get("readiness")
-        )
-        publication = _short(
-            _get_path(data, "publication", "status")
-            or _get_path(data, "publication", "state")
-            or data.get("publication")
-        )
+        readiness = _short(_readiness_status(data))
+        publication = _short(_publication_status(data))
     lines = [
         "KB Status",
         f"Lane: {snap['lane']}",
@@ -745,11 +758,17 @@ def _render_queue(data: Any, *, ctx: Any | None = None, target: str | None = Non
 
 def _card_for_command(ctx: Any, command: str, *, args: str = "", adapter: Any = None) -> dict[str, Any]:
     target = _mcp_target()
+    cockpit_args = {
+        "attention_limit": 5,
+        "include_publication": True,
+        "include_readiness": True,
+        "run_limit": 3,
+    }
     if command in {"kb", "today"}:
-        _, data, errors = _dispatch_first(ctx, target, [("attention.cockpit", {})])
+        _, data, errors = _dispatch_first(ctx, target, [("attention.cockpit", cockpit_args)])
         return _render_error("KB Today", target, errors) if data is None else _render_today(data)
     if command == "kbstatus":
-        _, data, _errors = _dispatch_first(ctx, target, [("attention.cockpit", {})])
+        _, data, _errors = _dispatch_first(ctx, target, [("attention.cockpit", cockpit_args)])
         return _render_status(data, target)
     if command == "runs":
         _, data, errors = _dispatch_first(
