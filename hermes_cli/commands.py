@@ -501,6 +501,29 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     return result
 
 
+def _telegram_hidden_command_prefixes() -> tuple[str, ...]:
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        raw = (
+            cfg_get(config, "display", "platforms", "telegram", "hidden_command_prefixes")
+            or cfg_get(config, "telegram", "hidden_command_prefixes")
+            or []
+        )
+    except Exception:
+        raw = []
+    if isinstance(raw, str):
+        raw = [raw]
+    prefixes: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            prefix = _sanitize_telegram_name(str(item or ""))
+            if prefix:
+                prefixes.append(prefix)
+    return tuple(dict.fromkeys(prefixes))
+
+
 _CMD_NAME_LIMIT = 32
 """Max command name length shared by Telegram and Discord."""
 
@@ -730,6 +753,13 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     )
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
     all_commands.extend((n, d) for n, d, _k in entries)
+    hidden_prefixes = _telegram_hidden_command_prefixes()
+    if hidden_prefixes:
+        all_commands = [
+            (name, desc)
+            for name, desc in all_commands
+            if not any(name.startswith(prefix) for prefix in hidden_prefixes)
+        ]
     return all_commands[:max_commands], hidden_count
 
 

@@ -1011,6 +1011,46 @@ class TestTelegramMenuCommands:
         assert "my_enabled_skill" in menu_names
         assert "my_disabled_skill" not in menu_names
 
+    def test_telegram_menu_hides_configured_command_prefixes(self, tmp_path, monkeypatch):
+        """Telegram menus can hide raw skill command families without disabling skills."""
+        from unittest.mock import patch
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "display:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      hidden_command_prefixes:\n"
+            "        - kb_engine_\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        fake_skills_dir = str(tmp_path / "skills")
+        fake_cmds = {
+            "/kb-engine-prod-workflow-sync": {
+                "name": "kb-engine-prod-workflow-sync",
+                "description": "Raw KB workflow skill",
+                "skill_md_path": f"{fake_skills_dir}/kb-engine-prod-workflow-sync/SKILL.md",
+                "skill_dir": f"{fake_skills_dir}/kb-engine-prod-workflow-sync",
+            },
+            "/daily-brief": {
+                "name": "daily-brief",
+                "description": "Daily brief",
+                "skill_md_path": f"{fake_skills_dir}/daily-brief/SKILL.md",
+                "skill_dir": f"{fake_skills_dir}/daily-brief",
+            },
+        }
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"),
+        ):
+            (tmp_path / "skills").mkdir(exist_ok=True)
+            menu, _ = telegram_menu_commands(max_commands=100)
+
+        menu_names = {n for n, _ in menu}
+        assert "daily_brief" in menu_names
+        assert "kb_engine_prod_workflow_sync" not in menu_names
+
     def test_external_dir_skills_included_in_telegram_menu(self, tmp_path, monkeypatch):
         """External skills (``skills.external_dirs``) must appear in the Telegram menu.
 
