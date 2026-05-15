@@ -147,6 +147,37 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_workflow_watcher_prompts_default_to_fail_noisy(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "Watch production kb_engine_prod workflow run gen-test. "
+                    "Call run_watch(run_id=\"gen-test\"). "
+                    "If terminal=false, send a concise interim progress line."
+                ),
+                schedule="every 5m",
+                name="Watch KB sync gen-test",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["silent_ok"] is False
+        assert created["job"]["require_tool_call"] is True
+
+    def test_explicit_silent_ok_overrides_watcher_inference(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Watch workflow run gen-test and call run_watch.",
+                schedule="every 5m",
+                silent_ok=True,
+                require_tool_call=False,
+            )
+        )
+        assert created["success"] is True
+        assert "silent_ok" not in created["job"]
+        assert "require_tool_call" not in created["job"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

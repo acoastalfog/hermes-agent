@@ -277,6 +277,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("silent_ok") is False:
+        result["silent_ok"] = False
+    if job.get("require_tool_call"):
+        result["require_tool_call"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -304,6 +308,8 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    silent_ok: Optional[bool] = None,
+    require_tool_call: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -335,6 +341,23 @@ def cronjob(
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
+            _silent_ok = True if silent_ok is None else bool(silent_ok)
+            _require_tool_call = False if require_tool_call is None else bool(require_tool_call)
+            if silent_ok is None or require_tool_call is None:
+                prompt_text = f"{name or ''}\n{prompt or ''}".lower()
+                looks_like_status_watcher = (
+                    "run_watch" in prompt_text
+                    or "run.watch" in prompt_text
+                    or (
+                        "workflow run" in prompt_text
+                        and ("terminal" in prompt_text or "progress" in prompt_text)
+                    )
+                )
+                if looks_like_status_watcher:
+                    if silent_ok is None:
+                        _silent_ok = False
+                    if require_tool_call is None and not _no_agent:
+                        _require_tool_call = True
 
             # Validate script path before storing
             if script:
@@ -370,6 +393,8 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                silent_ok=_silent_ok,
+                require_tool_call=_require_tool_call,
             )
             return json.dumps(
                 {
@@ -517,6 +542,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if silent_ok is not None:
+                updates["silent_ok"] = bool(silent_ok)
+            if require_tool_call is not None:
+                updates["require_tool_call"] = bool(require_tool_call)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -634,6 +663,24 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "silent_ok": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Whether a successful LLM-driven cron job may suppress delivery with [SILENT]. "
+                    "Set False for progress/status watchers that promised the user a check-in. "
+                    "If omitted, Hermes automatically sets False for obvious workflow-run watcher prompts."
+                ),
+            },
+            "require_tool_call": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "When True, the cron run fails noisily unless the agent calls at least one tool. "
+                    "Use this for watchdogs that must query live state rather than answer from prior context. "
+                    "If omitted, Hermes automatically sets True for obvious LLM-driven workflow-run watcher prompts."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -704,6 +751,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        silent_ok=args.get("silent_ok"),
+        require_tool_call=args.get("require_tool_call"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

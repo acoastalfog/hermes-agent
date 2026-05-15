@@ -931,6 +931,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+    job_contract: list[str] = []
+    if job.get("silent_ok") is False:
+        job_contract.append(
+            "[SILENT] is forbidden for this job: always return a delivered status "
+            "message, even if the status is 'still running' or the watcher cannot inspect state."
+        )
+    if job.get("require_tool_call"):
+        job_contract.append(
+            "You must call at least one relevant tool before your final response; "
+            "do not answer from memory, prior chat context, or the prompt alone."
+        )
+    if job_contract:
+        prompt = "[JOB CONTRACT: " + " ".join(job_contract) + "]\n\n" + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -1565,6 +1578,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             raise RuntimeError(_err_text)
 
+        if job.get("require_tool_call"):
+            messages = result.get("messages") if isinstance(result.get("messages"), list) else []
+            tool_turns = sum(
+                1
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("tool_calls")
+            )
+            if tool_turns < 1:
+                raise RuntimeError(
+                    "cron job requires at least one tool call, but the agent completed "
+                    "without calling tools"
+                )
+
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
@@ -1744,8 +1772,21 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
+                    if job.get("silent_ok") is False:
+                        error = (
+                            "Agent returned [SILENT], but this cron job requires "
+                            "a delivered status update."
+                        )
+                        success = False
+                        deliver_content = (
+                            f"⚠️ Cron job '{job.get('name', job['id'])}' produced no status update.\n\n"
+                            f"{error}\n\n"
+                            "This usually means a watcher prompt did not call the live status tool."
+                        )
+                        logger.warning("Job '%s': %s", job["id"], error)
+                    else:
+                        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                        should_deliver = False
 
                 delivery_error = None
                 if should_deliver:
