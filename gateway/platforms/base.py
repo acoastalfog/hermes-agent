@@ -1749,6 +1749,31 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_kb_actions(
+        self,
+        chat_id: str,
+        text: str,
+        actions: list,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a generic KB action card.
+
+        Platforms with native buttons override this.  The safe default keeps
+        the user-visible content and degrades actions to plain text labels.
+        """
+        labels: list[str] = []
+        for action in actions or []:
+            label = getattr(action, "label", None)
+            if label is None and isinstance(action, dict):
+                label = action.get("label")
+            if label:
+                labels.append(str(label))
+
+        fallback_text = text
+        if labels:
+            fallback_text = f"{text}\n\nActions: {', '.join(labels)}"
+        return await self.send(chat_id, fallback_text, metadata=metadata)
+
     async def send_clarify(
         self,
         chat_id: str,
