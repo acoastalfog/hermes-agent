@@ -1342,6 +1342,7 @@ def _render_queue(data: Any, *, ctx: Any | None = None, target: str | None = Non
         lines.append("")
         lines.append("Review one: /kb queue review 1")
         lines.append("Then preview a listed action, for example: /kb queue reject 1")
+        lines.append("Batch: /kb queue reject 1,2")
         lines.append("Confirm after preview: /kb queue reject 1 confirm")
     return {"title": "KB Queue", "text": "\n".join(lines), "actions": []}
 
