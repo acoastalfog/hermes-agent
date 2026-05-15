@@ -734,7 +734,7 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
 
         if (['md', 'markdown'].includes(lang)) {
           start('paragraph')
-          nodes.push(<Md compact={compact} key={key} t={t} text={block.join('\n')} />)
+          nodes.push(<Md cols={cols} compact={compact} key={key} t={t} text={block.join('\n')} />)
 
           continue
         }

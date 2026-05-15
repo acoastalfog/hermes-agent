@@ -24,6 +24,7 @@ const t = DEFAULT_THEME
 const BEL = String.fromCharCode(7)
 const ESC = String.fromCharCode(27)
 const CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
+const REPAINT_RE = new RegExp(`${ESC}\\[(?:\\d+)?[AF]`)
 const OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
 
 const renderAtWidth = (md: string, columns: number): string[] => {
@@ -55,10 +56,20 @@ const renderAtWidth = (md: string, columns: number): string[] => {
   instance.unmount()
   instance.cleanup()
 
-  return output
-    .replace(OSC_RE, '')
-    .split('\n')
-    .map(line => stripAnsi(line).replace(CSI_RE, '').trimEnd())
+  const cleaned = output.replace(OSC_RE, '')
+  const finalFrame = cleaned.split(REPAINT_RE).pop() ?? cleaned
+  const plain = stripAnsi(finalFrame).replace(CSI_RE, '')
+  const rawLines = plain.split(/\r\n|\n|\r/).map(line => line.trimEnd())
+  const firstLine = rawLines.find(line => line.trim().length > 0)
+
+  if (!firstLine) {
+    return rawLines
+  }
+
+  const joined = rawLines.join('\n')
+  const finalStart = joined.lastIndexOf(firstLine)
+
+  return (finalStart > 0 ? joined.slice(finalStart) : joined).split('\n')
 }
 
 const nonEmpty = (lines: string[]) => lines.filter(l => l.trim().length > 0)
@@ -290,6 +301,18 @@ const KITCHEN_SINK = [
   `| 3 | 李明 | /home/user/projects/backend/src/controllers/authentication/user_management_service_v2.py | ==HOT== | $\\sum_{i=0}^{n}$ | [link](https://example.com) | ${'Mixed 中英文 content with emoji 🔥 and special chars ─│┌┐ '.repeat(3).trim()} |`
 ].join('\n')
 
+// ── 21. Table inside a fenced markdown block ──────────────────────────
+// Recursive <Md> rendering must receive cols or nested tables bypass the
+// width-aware table renderer and take the max-content path.
+const FENCED_MARKDOWN_TABLE = [
+  '```markdown',
+  '| Project | Description | Status |',
+  '|---------|-------------|--------|',
+  '| Alpha | Very long description that should wrap or fall back in a narrow terminal | In Progress |',
+  '| Beta | Another deliberately verbose description to exercise nested markdown table sizing | Planning |',
+  '```'
+].join('\n')
+
 // ═══════════════════════════════════════════════════════════════════════
 // TEST SUITE
 // ═══════════════════════════════════════════════════════════════════════
@@ -314,7 +337,8 @@ const FIXTURES: Array<[string, string]> = [
   ['separator-lookalikes', SEPARATOR_LOOKALIKES],
   ['adjacent-tables', ADJACENT_TABLES],
   ['code-with-pipes', CODE_WITH_PIPES],
-  ['kitchen-sink', KITCHEN_SINK]
+  ['kitchen-sink', KITCHEN_SINK],
+  ['fenced-markdown-table', FENCED_MARKDOWN_TABLE]
 ]
 
 const WIDTHS = [40, 60, 80, 120]

@@ -29,6 +29,7 @@ const t = DEFAULT_THEME
 const BEL = String.fromCharCode(7)
 const ESC = String.fromCharCode(27)
 const CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
+const REPAINT_RE = new RegExp(`${ESC}\\[(?:\\d+)?[AF]`)
 const OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
 
 const renderAtWidth = (md: string, columns: number): string[] => {
@@ -60,10 +61,20 @@ const renderAtWidth = (md: string, columns: number): string[] => {
   instance.unmount()
   instance.cleanup()
 
-  return output
-    .replace(OSC_RE, '')
-    .split('\n')
-    .map(line => stripAnsi(line).replace(CSI_RE, '').trimEnd())
+  const cleaned = output.replace(OSC_RE, '')
+  const finalFrame = cleaned.split(REPAINT_RE).pop() ?? cleaned
+  const plain = stripAnsi(finalFrame).replace(CSI_RE, '')
+  const rawLines = plain.split(/\r\n|\n|\r/).map(line => line.trimEnd())
+  const firstLine = rawLines.find(line => line.trim().length > 0)
+
+  if (!firstLine) {
+    return rawLines
+  }
+
+  const joined = rawLines.join('\n')
+  const finalStart = joined.lastIndexOf(firstLine)
+
+  return (finalStart > 0 ? joined.slice(finalStart) : joined).split('\n')
 }
 
 // ── markdown table fixtures ────────────────────────────────────────────
