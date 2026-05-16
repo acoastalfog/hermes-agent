@@ -85,6 +85,35 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
 
 
+def _agent_activity_status_parts(
+    summary: Dict[str, Any],
+    *,
+    started_at: float = 0,
+    now: float | None = None,
+) -> List[str]:
+    """Build compact operator-facing progress details for a running agent."""
+    now = time.time() if now is None else now
+    status_parts: List[str] = []
+    if started_at:
+        elapsed_min = int((now - started_at) / 60)
+        if elapsed_min > 0:
+            status_parts.append(f"{elapsed_min} min elapsed")
+    iteration = summary.get("api_call_count", 0)
+    max_iter = summary.get("max_iterations", 0)
+    if max_iter:
+        status_parts.append(f"iteration {iteration}/{max_iter}")
+    current_tool = str(summary.get("current_tool") or "").strip()
+    last_desc = str(summary.get("last_activity_desc") or "").strip()
+    if current_tool:
+        detail = f"running: {current_tool}"
+        if last_desc and last_desc.lower() not in {current_tool.lower(), f"executing tool: {current_tool}".lower()}:
+            detail = f"{detail} — {last_desc}"
+        status_parts.append(detail)
+    elif last_desc:
+        status_parts.append(last_desc)
+    return status_parts
+
+
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
 # after a gateway restart when the user's next message starts new work.
@@ -2613,18 +2642,11 @@ class GatewayRunner:
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                status_parts = _agent_activity_status_parts(
+                    summary,
+                    started_at=self._running_agents_ts.get(session_key, 0),
+                    now=now,
+                )
             except Exception:
                 pass
 
@@ -15804,11 +15826,7 @@ class GatewayRunner:
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
+                        _parts = _agent_activity_status_parts(_a)
                         _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass

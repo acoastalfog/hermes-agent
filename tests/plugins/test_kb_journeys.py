@@ -1042,6 +1042,54 @@ def test_status_reports_live_attention_summary_shape(monkeypatch):
     assert "Publication: dirty" in card["text"]
 
 
+def test_status_falls_back_to_kb_profile_env_when_provider_status_hidden(monkeypatch, tmp_path):
+    from plugins.kb_journeys import _render_status
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for key in (
+        "HERMES_KB_MODE",
+        "HERMES_ENVIRONMENT",
+        "HERMES_KB_WORKSPACE",
+        "HERMES_KB_LLM_PROVIDER",
+        "HERMES_KB_LLM_MODEL",
+        "HERMES_KB_REASONING_EFFORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_KB_MODE=prod",
+                "HERMES_ENVIRONMENT=production",
+                "HERMES_KB_WORKSPACE=/home/abcosta/Knowledge/kb-anthony",
+                "HERMES_KB_LLM_PROVIDER=plugin:openai-compatible",
+                "HERMES_KB_LLM_MODEL=gpt-5.5",
+                "HERMES_KB_REASONING_EFFORT=low",
+                "OPENAI_API_KEY=sk-redacted",
+            ]
+        )
+        + "\n"
+    )
+
+    card = _render_status(
+        {
+            "summary": {"publication_status": "clean", "readiness_status": "degraded"},
+        },
+        "kb_engine_prod",
+        None,
+    )
+
+    assert "Lane: prod" in card["text"]
+    assert "Environment: production" in card["text"]
+    assert "Workspace: /home/abcosta/Knowledge/kb-anthony" in card["text"]
+    assert "Hermes provider/API:" in card["text"]
+    assert "OPENAI" in card["text"]
+    assert "KB provider: plugin:openai-compatible" in card["text"]
+    assert "KB model: gpt-5.5" in card["text"]
+    assert "KB reasoning: low" in card["text"]
+    assert "Readiness: degraded" in card["text"]
+    assert "Publication: clean" in card["text"]
+
+
 def test_kb_status_fetches_provider_status_and_shows_both_reasoning(monkeypatch):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
@@ -1094,6 +1142,55 @@ def test_kb_status_fetches_provider_status_and_shows_both_reasoning(monkeypatch)
     assert "KB reasoning: low" in text
     assert "KB model: gpt-5.5" in text
     assert "KB provider: plugin:openai-compatible" in text
+
+
+def test_kb_status_uses_profile_env_when_provider_status_hidden(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    for key in (
+        "HERMES_KB_LLM_PROVIDER",
+        "HERMES_KB_LLM_MODEL",
+        "HERMES_KB_REASONING_EFFORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_KB_LLM_PROVIDER=plugin:openai-compatible",
+                "HERMES_KB_LLM_MODEL=gpt-5.5",
+                "HERMES_KB_REASONING_EFFORT=low",
+            ]
+        )
+        + "\n"
+    )
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_attention_cockpit": {
+                "result": {
+                    "readiness": {"status": "degraded"},
+                    "publication": {"status": "clean"},
+                }
+            },
+            "mcp_kb_engine_prod_provider_status": {
+                "error": "MCP tool is not visible in profile journey_first_strict: provider.status",
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb status"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    text = adapter.sent[0]["text"]
+    assert "KB provider: plugin:openai-compatible" in text
+    assert "KB model: gpt-5.5" in text
+    assert "KB reasoning: low" in text
+    assert "Readiness: degraded" in text
+    assert "Publication: clean" in text
 
 
 def test_kb_status_prefers_live_hermes_session_reasoning(monkeypatch):

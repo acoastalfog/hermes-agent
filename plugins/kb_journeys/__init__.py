@@ -409,8 +409,79 @@ def _render_dashboard(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
     return {"title": "KB Dashboard", "text": "\n".join(lines), "actions": []}
 
 
+def _strip_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _selected_env_values(keys: set[str]) -> dict[str, str]:
+    values = {key: value for key in keys if (value := os.getenv(key))}
+    missing = keys.difference(values)
+    if not missing:
+        return values
+    try:
+        from hermes_cli.config import get_env_path
+
+        env_path = get_env_path()
+        lines = env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except Exception:
+        return values
+    for line in lines:
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if key in missing and key not in values:
+            values[key] = _strip_env_value(value)
+    return values
+
+
+def _first_env(env: dict[str, str], *keys: str) -> str | None:
+    for key in keys:
+        value = env.get(key)
+        if value:
+            return value
+    return None
+
+
 def _config_snapshot() -> dict[str, str]:
     config: dict[str, Any] = {}
+    env_keys = {
+        "ANTHROPIC_API_KEY",
+        "ENVIRONMENT",
+        "HERMES_API_MODE",
+        "HERMES_ENV",
+        "HERMES_ENVIRONMENT",
+        "HERMES_KB_LANE",
+        "HERMES_KB_LLM_MODEL",
+        "HERMES_KB_LLM_PROVIDER",
+        "HERMES_KB_MODE",
+        "HERMES_KB_MODEL",
+        "HERMES_KB_PROVIDER",
+        "HERMES_KB_REASONING_EFFORT",
+        "HERMES_KB_WORKSPACE",
+        "HERMES_MODEL",
+        "HERMES_MODEL_API_MODE",
+        "HERMES_PROFILE",
+        "HERMES_PROVIDER",
+        "HERMES_REASONING_EFFORT",
+        "KB_LLM_MODEL",
+        "KB_LLM_PROVIDER",
+        "KB_LLM_REASONING_EFFORT",
+        "KB_OPENAI_COMPAT_MODEL",
+        "KB_PROVIDER",
+        "KB_WORKSPACE",
+        "MODEL",
+        "MODEL_PROVIDER",
+        "NVIDIA_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_REASONING_EFFORT",
+        "OPENROUTER_API_KEY",
+    }
+    env = _selected_env_values(env_keys)
     try:
         from hermes_cli.config import load_config
 
@@ -437,10 +508,10 @@ def _config_snapshot() -> dict[str, str]:
         api_mode = None
         reasoning = None
 
-    provider = provider or os.getenv("HERMES_PROVIDER") or os.getenv("MODEL_PROVIDER")
-    model = model or os.getenv("HERMES_MODEL") or os.getenv("MODEL")
-    reasoning = reasoning or os.getenv("HERMES_REASONING_EFFORT") or os.getenv("OPENAI_REASONING_EFFORT")
-    api_mode = api_mode or os.getenv("HERMES_MODEL_API_MODE") or os.getenv("HERMES_API_MODE")
+    provider = provider or _first_env(env, "HERMES_PROVIDER", "MODEL_PROVIDER")
+    model = model or _first_env(env, "HERMES_MODEL", "MODEL")
+    reasoning = reasoning or _first_env(env, "HERMES_REASONING_EFFORT", "OPENAI_REASONING_EFFORT")
+    api_mode = api_mode or _first_env(env, "HERMES_MODEL_API_MODE", "HERMES_API_MODE")
 
     api_envs = [
         "NVIDIA_API_KEY",
@@ -448,23 +519,32 @@ def _config_snapshot() -> dict[str, str]:
         "ANTHROPIC_API_KEY",
         "OPENROUTER_API_KEY",
     ]
-    configured = [name.removesuffix("_API_KEY") for name in api_envs if os.getenv(name)]
+    configured = [name.removesuffix("_API_KEY") for name in api_envs if env.get(name)]
 
     return {
-        "lane": os.getenv("HERMES_KB_MODE") or os.getenv("HERMES_KB_LANE") or os.getenv("HERMES_PROFILE") or "unknown",
+        "lane": _first_env(env, "HERMES_KB_MODE", "HERMES_KB_LANE", "HERMES_PROFILE") or "unknown",
         "environment": (
-            os.getenv("HERMES_ENVIRONMENT")
-            or os.getenv("HERMES_ENV")
-            or os.getenv("ENVIRONMENT")
-            or os.getenv("HERMES_PROFILE")
+            _first_env(env, "HERMES_ENVIRONMENT", "HERMES_ENV", "ENVIRONMENT", "HERMES_PROFILE")
             or "unknown"
         ),
-        "workspace": os.getenv("HERMES_KB_WORKSPACE") or os.getenv("KB_WORKSPACE") or "not set",
+        "workspace": _first_env(env, "HERMES_KB_WORKSPACE", "KB_WORKSPACE") or "not set",
         "model": _short(model, "not set"),
         "provider": _short(provider, "not set"),
         "api_mode": _short(api_mode, "not set"),
         "api": ", ".join(configured) if configured else "not detected",
         "reasoning": _short(reasoning, "not set"),
+        "kb_provider": _short(
+            _first_env(env, "HERMES_KB_LLM_PROVIDER", "HERMES_KB_PROVIDER", "KB_LLM_PROVIDER", "KB_PROVIDER"),
+            "unknown",
+        ),
+        "kb_model": _short(
+            _first_env(env, "HERMES_KB_LLM_MODEL", "HERMES_KB_MODEL", "KB_LLM_MODEL", "KB_OPENAI_COMPAT_MODEL"),
+            "unknown",
+        ),
+        "kb_reasoning": _short(
+            _first_env(env, "HERMES_KB_REASONING_EFFORT", "KB_LLM_REASONING_EFFORT"),
+            "unknown",
+        ),
     }
 
 
@@ -481,13 +561,14 @@ def _primary_provider_target(provider_data: Any) -> dict[str, Any]:
     return dict_targets[0] if dict_targets else {}
 
 
-def _provider_status_summary(provider_data: Any) -> dict[str, str]:
+def _provider_status_summary(provider_data: Any, fallback: dict[str, str] | None = None) -> dict[str, str]:
     primary = _primary_provider_target(provider_data)
     if not primary:
+        fallback = fallback or {}
         return {
-            "provider": "unknown",
-            "model": "unknown",
-            "reasoning": "unknown",
+            "provider": fallback.get("kb_provider") or "unknown",
+            "model": fallback.get("kb_model") or "unknown",
+            "reasoning": fallback.get("kb_reasoning") or "unknown",
             "status": "unknown",
         }
     return {
@@ -529,7 +610,7 @@ def _render_status(
     snap = _config_snapshot()
     if hermes_reasoning:
         snap["reasoning"] = hermes_reasoning
-    kb = _provider_status_summary(provider_data)
+    kb = _provider_status_summary(provider_data, snap)
     readiness = "unknown"
     publication = "unknown"
     if isinstance(data, dict):
