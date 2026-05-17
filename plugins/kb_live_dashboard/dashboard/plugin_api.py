@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -24,7 +25,7 @@ async def live_dashboard(limit: int = Query(default=8, ge=1, le=50)) -> dict[str
     try:
         proc = subprocess.run(
             command,
-            cwd=os.environ.get("HERMES_KB_WORKSPACE") or None,
+            cwd=_dashboard_cwd(command),
             text=True,
             capture_output=True,
             timeout=float(os.environ.get("HERMES_KB_DASHBOARD_TIMEOUT_SECONDS", "20") or 20),
@@ -101,6 +102,15 @@ def _dashboard_command(*, limit: int) -> list[str]:
         args_json,
         "--json",
     ]
+
+
+def _dashboard_cwd(command: list[str]) -> str | None:
+    if command and command[0] == "ssh":
+        return None
+    workspace = os.environ.get("HERMES_KB_WORKSPACE") or ""
+    if workspace and Path(workspace).is_dir():
+        return workspace
+    return None
 
 
 def _refresh_hermes_env() -> None:

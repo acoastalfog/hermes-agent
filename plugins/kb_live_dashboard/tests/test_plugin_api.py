@@ -82,11 +82,29 @@ def test_dashboard_command_refreshes_hermes_env(monkeypatch, tmp_path):
     assert "dashboard.live" in command[-1]
 
 
+def test_dashboard_cwd_is_none_for_ssh_command(monkeypatch):
+    module = _load_module()
+
+    monkeypatch.setenv("HERMES_KB_WORKSPACE", "/remote-only/kb-anthony")
+
+    assert module._dashboard_cwd(["ssh", "-T", "helix-vpn", "kb"]) is None
+
+
+def test_dashboard_cwd_uses_existing_local_workspace(monkeypatch, tmp_path):
+    module = _load_module()
+
+    monkeypatch.setenv("HERMES_KB_WORKSPACE", str(tmp_path))
+
+    assert module._dashboard_cwd(["kb", "mcp", "call", "dashboard.live"]) == str(tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_live_dashboard_unwraps_mcp_packet(monkeypatch):
     module = _load_module()
+    seen = {}
 
-    def fake_run(*_args, **_kwargs):
+    def fake_run(*_args, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
@@ -107,6 +125,7 @@ async def test_live_dashboard_unwraps_mcp_packet(monkeypatch):
     assert result["ok"] is True
     assert result["payload"]["surface"] == "dashboard.live"
     assert result["payload"]["summary"]["readiness_status"] == "ready"
+    assert seen["cwd"] is None
 
 
 @pytest.mark.asyncio
