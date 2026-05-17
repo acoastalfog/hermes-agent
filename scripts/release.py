@@ -58,7 +58,13 @@ AUTHOR_MAP = {
     "altriatree@gmail.com": "TruaShamu",
     "m@mobrienv.dev": "mikeyobrien",
     "qiyin.zuo@pcitc.com": "qiyin-code",
+    "mr.aashiz@gmail.com": "aashizpoudel",
+    "70629228+shaun0927@users.noreply.github.com": "shaun0927",
+    "98262967+Bihruze@users.noreply.github.com": "Bihruze",
+    "nidhi2894@gmail.com": "nidhi-singh02",
+    "30312689+aashizpoudel@users.noreply.github.com": "aashizpoudel",
     "oleksii.lisikh@gmail.com": "olisikh",
+    "jithendranaidunara@gmail.com": "JithendraNara",
     "jeremy@geocaching.com": "outdoorsea",
     "leone.parise@gmail.com": "leoneparise",
     "mr@shu.io": "mrshu",
@@ -69,6 +75,7 @@ AUTHOR_MAP = {
     "teknium@nousresearch.com": "teknium1",
     "piyushvp1@gmail.com": "thelumiereguy",
     "421774554@qq.com": "wuli666",
+    "twebefy@gmail.com": "tw2818",
     "harish.kukreja@gmail.com": "counterposition",
     "korkyzer@gmail.com": "Korkyzer",
     "1046611633@qq.com": "zhengyn0001",
@@ -86,9 +93,12 @@ AUTHOR_MAP = {
     "30397170+1000Delta@users.noreply.github.com": "1000Delta",
     "szymonclawd@mac.home": "szymonclawd",
     "257759490+szymonclawd@users.noreply.github.com": "szymonclawd",
+    "101180447+worlldz@users.noreply.github.com": "worlldz",
     "zhanganzhe@tenclass.com": "luoyuctl",
     "51604064+luoyuctl@users.noreply.github.com": "luoyuctl",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
+    "tolle.lege+github@gmail.com": "InB4DevOps",
+    "73686890+InB4DevOps@users.noreply.github.com": "InB4DevOps",
     "147827411+EloquentBrush@users.noreply.github.com": "AhmetArif0",
     "97489706+purzbeats@users.noreply.github.com": "purzbeats",
     "hugosequier@gmail.com": "Hugo-SEQUIER",
@@ -111,6 +121,7 @@ AUTHOR_MAP = {
     "oswaldb22@users.noreply.github.com": "oswaldb22",
     "abdielv@proton.me": "AJV20",
     "mason@growagainorchids.com": "masonjames",
+    "108541149+amethystani@users.noreply.github.com": "amethystani",
     "ytchen0719@gmail.com": "liquidchen",
     "am@studio1.tailb672fe.ts.net": "subtract0",
     "mike@grossmann.at": "ReqX",
@@ -217,6 +228,7 @@ AUTHOR_MAP = {
     "74749461+yuga-hashimoto@users.noreply.github.com": "yuga-hashimoto",
     "xiangyong@zspace.cn": "CES4751",
     "harish.kukreja@gmail.com": "counterposition",
+    "nidhi2894@gmail.com": "nidhi-singh02",
     "35294173+Fearvox@users.noreply.github.com": "Fearvox",
     "hypnus.yuan@gmail.com": "Hypnus-Yuan",
     "15558128926@qq.com": "xsfX20",
@@ -258,6 +270,7 @@ AUTHOR_MAP = {
     "yuxiangl490@gmail.com": "y0shua1ee",
     "manmit0x@gmail.com": "0xDevNinja",
     "stevekelly622@gmail.com": "steezkelly",
+    "brian@dralth.com": "btorresgil",
     "momowind@gmail.com": "momowind",
     "clockwork-codex@users.noreply.github.com": "misery-hl",
     "207811921+misery-hl@users.noreply.github.com": "misery-hl",
@@ -398,6 +411,7 @@ AUTHOR_MAP = {
     "Mibayy@users.noreply.github.com": "Mibayy",
     "mibayy@users.noreply.github.com": "Mibayy",
     "mibay@clawhub.io": "Mibayy",
+    "louismichalot@hotmail.com": "Mibayy",
     "135070653+sgaofen@users.noreply.github.com": "sgaofen",
     "lzy.dev@gmail.com": "zhiyanliu",
     "me@janstepanovsky.cz": "hhhonzik",
@@ -745,6 +759,7 @@ AUTHOR_MAP = {
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
     "asurla@nvidia.com": "anniesurla",
+    "kchantharuan@nvidia.com": "nv-kasikritc",
     "limkuan24@gmail.com": "WideLee",
     "aviralarora002@gmail.com": "AviArora02-commits",
     "draixagent@gmail.com": "draix",
@@ -1063,6 +1078,14 @@ AUTHOR_MAP = {
     "37467487+yifengingit@users.noreply.github.com": "yifengingit",  # PR #25589 salvage (AUTOINCREMENT id ordering)
     "89525629+vanthinh6886@users.noreply.github.com": "vanthinh6886",  # PR #25562 salvage (.env 0600 perms)
     "16034932+Arkmusn@users.noreply.github.com": "Arkmusn",  # PR #25559 salvage (approvals.timeout from config)
+    "nidhi2894@gmail.com": "nidhi-singh02",  # PR #2752 salvage (slack whitespace-only IndexError guard)
+    "38173192+nidhi-singh02@users.noreply.github.com": "nidhi-singh02",
+    "Jaaneek@users.noreply.github.com": "Jaaneek",  # PR #26457 (xAI Grok OAuth provider)
+    # v0.14.0 additions
+    "chuang.guo@hopechart.com": "wuwuzhijing",  # PR #21063 salvage (gateway docs mention Weixin)
+    "nightcityblade@gmail.com": "nightcityblade",  # PR #24138 (docs voice/tts table)
+    "pol.kuijken@gmail.com": "polkn",  # PR #6136 salvage (skill_view collision refusal)
+    "robin@soal.org": "rewbs",
 }
 
 
