@@ -400,6 +400,11 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        if not normalized:
+            return tool_error(
+                "action is required. Use one of: create, list, update, pause, resume, remove, run",
+                success=False,
+            )
 
         if normalized == "create":
             if not schedule:

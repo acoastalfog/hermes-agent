@@ -638,9 +638,18 @@ def _render_runs(data: Any) -> dict[str, Any]:
     if isinstance(data, str):
         return {"title": "KB Runs", "text": f"KB Runs\n{data}", "actions": []}
     if isinstance(data, dict):
-        active = _items(data, ("active",), ("runs", "active"))
-        recent = _items(data, ("recent",), ("runs", "recent"))
-        runs = [*active, *recent] or _items(data, ("runs",))
+        runs = []
+        for found in (
+            _get_path(data, "active"),
+            _get_path(data, "runs", "active"),
+            _get_path(data, "recent"),
+            _get_path(data, "runs", "recent"),
+        ):
+            if isinstance(found, list):
+                runs.extend(found)
+        if not runs:
+            found = _get_path(data, "runs")
+            runs = found if isinstance(found, list) else []
     else:
         runs = []
     lines = ["KB Runs"]
@@ -650,8 +659,15 @@ def _render_runs(data: Any) -> dict[str, Any]:
         if isinstance(run, dict):
             status = _short(run.get("status") or run.get("state") or run.get("phase"))
             detail = _short(run.get("summary") or run.get("message") or run.get("updated_at"), "")
+            staleness = run.get("staleness") if isinstance(run.get("staleness"), dict) else {}
+            if staleness.get("stale"):
+                detail = f"stalled {_short(staleness.get('last_trace_age_seconds'), 'unknown')}s"
+                action = _short(run.get("recommended_next_action"), "")
+                if action:
+                    detail += f"; {action}"
             suffix = f" - {detail}" if detail else ""
-            lines.append(f"{idx}. {_item_title(run)}: {status}{suffix}")
+            title = _short(run.get("run_id") or run.get("workflow_id") or _item_title(run))
+            lines.append(f"{idx}. {title}: {status}{suffix}")
         else:
             lines.append(f"{idx}. {_short(run)}")
     return {"title": "KB Runs", "text": "\n".join(lines), "actions": []}
@@ -1713,8 +1729,62 @@ def _workflow_start_text(ctx: Any, target: str, plan: dict[str, Any]) -> str:
     text = _workflow_status_text("Workflow start result", payload)
     run_id = _workflow_run_id(payload)
     if run_id:
-        text += "\nUse /kb runs for progress. Hermes should also keep watching in the main conversation."
+        progress_text = _workflow_initial_progress_text(ctx, target, run_id)
+        if progress_text:
+            text += "\n" + progress_text
+        text += "\nNext: /kb runs"
     return text
+
+
+def _workflow_initial_progress_text(ctx: Any, target: str, run_id: str) -> str:
+    payload = _result_payload(
+        ctx.dispatch_tool(
+            _mcp_tool_name(target, "run.watch"),
+            {
+                "run_id": run_id,
+                "timeout_seconds": 0,
+                "poll_interval_seconds": 1,
+                "timeline_limit": 5,
+            },
+        )
+    )
+    if isinstance(payload, dict) and payload.get("error"):
+        return "Initial progress: unavailable - " + _short(payload.get("error"))
+    if not isinstance(payload, dict):
+        return ""
+    digest = payload.get("progress_digest") if isinstance(payload.get("progress_digest"), dict) else payload
+    progress = digest.get("progress") if isinstance(digest.get("progress"), dict) else {}
+    stage = digest.get("stage") if isinstance(digest.get("stage"), dict) else {}
+    provider = digest.get("provider") if isinstance(digest.get("provider"), dict) else {}
+    staleness = digest.get("staleness") if isinstance(digest.get("staleness"), dict) else {}
+    phase = _short(progress.get("current_phase") or progress.get("current_step") or digest.get("status"), "")
+    detail = _short(progress.get("current_detail") or progress.get("latest_message"), "")
+    lines: list[str] = []
+    if phase:
+        lines.append(f"Initial progress: {phase}" + (f" - {detail}" if detail else ""))
+    stage_id = _short(stage.get("stage_id") or stage.get("call_name"), "")
+    total = stage.get("total")
+    if stage_id and total not in {None, ""}:
+        try:
+            failed_count = int(stage.get("failed") or 0)
+        except (TypeError, ValueError):
+            failed_count = 0
+        lines.append(
+            f"Stage: {stage_id} {_short(stage.get('completed'), '0')}/{_short(total, '0')}"
+            + (f" failed {_short(stage.get('failed'), '0')}" if failed_count else "")
+        )
+    provider_name = _short(provider.get("provider"), "")
+    model = _short(provider.get("model"), "")
+    if provider_name or model:
+        lines.append(f"Provider: {provider_name or 'unknown'} / {model or 'unknown'}")
+    if staleness.get("stale"):
+        age = _short(staleness.get("last_trace_age_seconds"), "unknown")
+        lines.append(f"Attention: run appears stalled; no trace progress for {age}s")
+    if payload.get("terminal") is False:
+        lines.append("Watch: still running")
+    elif payload.get("terminal") is True:
+        lines.append("Watch: terminal")
+    return "\n".join(lines)
 
 
 def _workflow_run_id(payload: Any) -> str:

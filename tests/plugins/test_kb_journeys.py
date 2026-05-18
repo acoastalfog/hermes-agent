@@ -917,6 +917,23 @@ def test_run_command_previews_and_starts_with_confirmed_envelope(monkeypatch):
                     "followthrough_contract": {"recommended_next_action": "watch_until_terminal"},
                 }
             },
+            "mcp_kb_engine_prod_run_watch": {
+                "result": {
+                    "status": "running",
+                    "terminal": False,
+                    "progress_digest": {
+                        "status": "running",
+                        "progress": {"current_phase": "Classifying", "current_detail": "entity_admission"},
+                        "stage": {
+                            "stage_id": "entity_admission",
+                            "total": 1,
+                            "completed": 0,
+                            "failed": 0,
+                        },
+                        "provider": {"provider": "plugin:openai-compatible", "model": "gpt-5.5"},
+                    },
+                }
+            },
         }
     )
     adapter = FakeKbActionsAdapter()
@@ -946,12 +963,53 @@ def test_run_command_previews_and_starts_with_confirmed_envelope(monkeypatch):
     assert started == {"action": "skip", "reason": "kb_journeys"}
     assert "Workflow start result" in adapter.sent[1]["text"]
     assert "gen-123" in adapter.sent[1]["text"]
-    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_workflow_start_confirmed"
-    envelope = ctx.calls[-1][1]["envelope"]
+    assert "Initial progress: Classifying - entity_admission" in adapter.sent[1]["text"]
+    assert "Stage: entity_admission 0/1" in adapter.sent[1]["text"]
+    assert "Provider: plugin:openai-compatible / gpt-5.5" in adapter.sent[1]["text"]
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_workflow_start_confirmed"
+    assert ctx.calls[-1] == (
+        "mcp_kb_engine_prod_run_watch",
+        {"run_id": "gen-123", "timeout_seconds": 0, "poll_interval_seconds": 1, "timeline_limit": 5},
+    )
+    envelope = ctx.calls[-2][1]["envelope"]
     assert envelope["tool"] == "workflow.start_confirmed"
     assert envelope["plan"]["workflow_id"] == "update_kb"
     assert envelope["user_confirmation"]["confirmed"] is True
     assert envelope["user_confirmation"]["surface"] == "telegram"
+
+
+def test_runs_command_surfaces_stalled_progress(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_run_health": {
+                "result": {
+                    "status": "attention_needed",
+                    "runs": [
+                        {
+                            "run_id": "gen-stale",
+                            "workflow_id": "update_kb",
+                            "status": "stalled_unobserved",
+                            "staleness": {"stale": True, "last_trace_age_seconds": 7200},
+                            "recommended_next_action": "recover_stalled_run",
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb runs"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert "stalled_unobserved" in adapter.sent[0]["text"]
+    assert "stalled 7200s" in adapter.sent[0]["text"]
+    assert "recover_stalled_run" in adapter.sent[0]["text"]
 
 
 def test_non_telegram_or_unknown_command_is_ignored(monkeypatch):

@@ -185,6 +185,12 @@ class TestUnifiedCronjobTool:
         assert created["job"]["silent_ok"] is False
         assert created["job"]["require_tool_call"] is True
 
+    def test_missing_action_reports_action_validation_error(self):
+        result = json.loads(cronjob(action=""))
+
+        assert result["success"] is False
+        assert "action is required" in result["error"]
+
     def test_explicit_silent_ok_overrides_watcher_inference(self):
         created = json.loads(
             cronjob(
