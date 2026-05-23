@@ -8,6 +8,7 @@ from hermes_cli.tools_config import (
     _DEFAULT_OFF_TOOLSETS,
     _apply_toolset_change,
     _configure_provider,
+    _apply_telegram_mcp_posture_filter,
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
@@ -19,6 +20,39 @@ from hermes_cli.tools_config import (
     _visible_providers,
     tools_command,
 )
+
+
+def _register_posture_mcp_tools():
+    from tools.registry import registry
+
+    toolset = "mcp-kb_test_posture"
+    tools = [
+        "mcp_kb_test_posture_dashboard_live",
+        "mcp_kb_test_posture_queue_summary",
+        "mcp_kb_test_posture_workflow_start_confirmed",
+        "mcp_kb_test_posture_publication_commit_confirmed",
+        "mcp_kb_test_posture_run_health",
+    ]
+    for name in tools:
+        registry.register(
+            name=name,
+            toolset=toolset,
+            schema={
+                "name": name,
+                "description": f"Test MCP tool {name}",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args: "{}",
+        )
+    registry.register_toolset_alias("kb_test_posture", toolset)
+    return tools
+
+
+def _deregister_posture_mcp_tools(tools):
+    from tools.registry import registry
+
+    for name in tools:
+        registry.deregister(name)
 
 
 def test_agent_disabled_toolsets_suppresses_across_platforms():
@@ -262,6 +296,79 @@ def test_get_platform_tools_includes_enabled_mcp_servers_by_default():
     assert "exa" in enabled
     assert "web-search-prime" in enabled
     assert "disabled-server" not in enabled
+
+
+def test_model_tools_accepts_explicit_tool_entries_for_posture_filters():
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import registry
+
+    name = "posture_direct_tool"
+    registry.register(
+        name=name,
+        toolset="posture_direct_toolset",
+        schema={
+            "name": name,
+            "description": "Directly selected test tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "{}",
+    )
+    try:
+        _clear_tool_defs_cache()
+        defs = get_tool_definitions(enabled_toolsets=[f"tool:{name}"], quiet_mode=True)
+    finally:
+        registry.deregister(name)
+        _clear_tool_defs_cache()
+
+    assert [tool["function"]["name"] for tool in defs] == [name]
+
+
+def test_telegram_ordinary_mcp_posture_keeps_read_context_tools_only():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="what needs my attention today?",
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert "web" in filtered
+    assert "kb_test_posture" not in filtered
+    assert "tool:mcp_kb_test_posture_dashboard_live" in filtered
+    assert "tool:mcp_kb_test_posture_queue_summary" in filtered
+    assert "tool:mcp_kb_test_posture_workflow_start_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_publication_commit_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_run_health" not in filtered
+
+
+def test_telegram_explicit_commitment_mcp_posture_leaves_server_toolset_enabled():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="show KB status and logs before I approve anything",
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert filtered == ["web", "kb_test_posture"]
+
+
+def test_non_telegram_mcp_posture_is_unchanged():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="what needs my attention today?",
+            platform="cli",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert filtered == ["web", "kb_test_posture"]
 
 
 def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_selection():

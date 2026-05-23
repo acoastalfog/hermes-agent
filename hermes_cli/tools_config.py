@@ -12,6 +12,7 @@ the `platform_toolsets` key.
 import json as _json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,25 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord_admin": {"discord"},
 }
 
+_TELEGRAM_COMMITMENT_MCP_TRIGGER_RE = re.compile(
+    r"\b("
+    r"approve|archive|commit|confirm|deploy|diagnos(?:e|tic|tics)|fix|"
+    r"health|inspect|logs?|publish|push|repair|restart|review|run|send|"
+    r"start|status|sync|workflow"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_TELEGRAM_GATED_MCP_TOOL_RE = re.compile(
+    r"(?:^|_)("
+    r"approve|archive|batch_decide|commit|complete|confirmed|create|"
+    r"delete|demote|diagnos(?:e|tic|tics)|health|inspect|logs?|"
+    r"publication|publish|push|reject|repair|run|send|start|status|"
+    r"update|watch|workflow|write"
+    r")(?:_|$)",
+    re.IGNORECASE,
+)
+
 
 def _toolset_allowed_for_platform(ts_key: str, platform: str) -> bool:
     """Return True if ``ts_key`` is configurable on ``platform``.
@@ -114,6 +134,91 @@ def _toolset_allowed_for_platform(ts_key: str, platform: str) -> bool:
     """
     allowed = _TOOLSET_PLATFORM_RESTRICTIONS.get(ts_key)
     return allowed is None or platform in allowed
+
+
+def _telegram_message_requests_commitment_mcp(message: str) -> bool:
+    """Return True when Telegram text explicitly asks for action/diagnostics."""
+    text = (message or "").strip()
+    if not text:
+        return False
+    if text.startswith("/"):
+        return True
+    return bool(_TELEGRAM_COMMITMENT_MCP_TRIGGER_RE.search(text))
+
+
+def _mcp_toolset_target(toolset_name: str) -> str | None:
+    """Return the canonical MCP toolset name for a raw or canonical entry."""
+    try:
+        from tools.registry import registry
+    except Exception:
+        return None
+
+    target = registry.get_toolset_alias_target(toolset_name) or toolset_name
+    return target if str(target).startswith("mcp-") else None
+
+
+def _telegram_mcp_tool_is_gated(tool_name: str) -> bool:
+    """Classify MCP tools that should be hidden from ordinary Telegram chat."""
+    name = str(tool_name or "")
+    if not name.startswith("mcp_"):
+        return False
+    return bool(_TELEGRAM_GATED_MCP_TOOL_RE.search(name))
+
+
+def _apply_telegram_mcp_posture_filter(
+    enabled_toolsets: List[str],
+    *,
+    message: str,
+    platform: str,
+) -> List[str]:
+    """Narrow Telegram MCP schemas for ordinary conversation turns.
+
+    Telegram should keep MCP read/context tools available in casual chat, but
+    workflow, action, and diagnostic MCP tools should only be advertised when
+    the user explicitly asks to commit, start, publish, approve, inspect,
+    view status/logs, or similar.  The filter converts MCP server toolsets
+    into exact ``tool:<name>`` entries so safe tools remain available without
+    exposing the whole server.
+    """
+    if str(platform or "").lower() != "telegram":
+        return list(enabled_toolsets or [])
+    if _telegram_message_requests_commitment_mcp(message):
+        return list(enabled_toolsets or [])
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return list(enabled_toolsets or [])
+
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for toolset_name in enabled_toolsets or []:
+        ts = str(toolset_name)
+        mcp_target = _mcp_toolset_target(ts)
+        if not mcp_target:
+            if ts not in seen:
+                filtered.append(ts)
+                seen.add(ts)
+            continue
+
+        tool_names = registry.get_tool_names_for_toolset(mcp_target)
+        if not tool_names:
+            # Discovery has not populated the registry yet; leave the entry
+            # unchanged so startup ordering does not silently erase MCP.
+            if ts not in seen:
+                filtered.append(ts)
+                seen.add(ts)
+            continue
+
+        for tool_name in tool_names:
+            if _telegram_mcp_tool_is_gated(tool_name):
+                continue
+            direct = f"tool:{tool_name}"
+            if direct not in seen:
+                filtered.append(direct)
+                seen.add(direct)
+
+    return filtered
 
 
 def _get_effective_configurable_toolsets():

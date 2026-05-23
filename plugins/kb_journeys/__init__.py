@@ -1726,17 +1726,23 @@ def _workflow_start_text(ctx: Any, target: str, plan: dict[str, Any]) -> str:
             {"envelope": envelope},
         )
     )
-    text = _workflow_status_text("Workflow start result", payload)
+    text = _workflow_status_text("Workflow start result", payload, include_run_details=False)
     run_id = _workflow_run_id(payload)
     if run_id:
-        progress_text = _workflow_initial_progress_text(ctx, target, run_id)
+        progress_text = _workflow_initial_progress_text(ctx, target, run_id, include_run_details=False)
         if progress_text:
             text += "\n" + progress_text
-        text += "\nNext: /kb runs"
+        text += "\nDetails: /kb runs"
     return text
 
 
-def _workflow_initial_progress_text(ctx: Any, target: str, run_id: str) -> str:
+def _workflow_initial_progress_text(
+    ctx: Any,
+    target: str,
+    run_id: str,
+    *,
+    include_run_details: bool = True,
+) -> str:
     payload = _result_payload(
         ctx.dispatch_tool(
             _mcp_tool_name(target, "run.watch"),
@@ -1761,29 +1767,33 @@ def _workflow_initial_progress_text(ctx: Any, target: str, run_id: str) -> str:
     detail = _short(progress.get("current_detail") or progress.get("latest_message"), "")
     lines: list[str] = []
     if phase:
-        lines.append(f"Initial progress: {phase}" + (f" - {detail}" if detail else ""))
-    stage_id = _short(stage.get("stage_id") or stage.get("call_name"), "")
-    total = stage.get("total")
-    if stage_id and total not in {None, ""}:
-        try:
-            failed_count = int(stage.get("failed") or 0)
-        except (TypeError, ValueError):
-            failed_count = 0
         lines.append(
-            f"Stage: {stage_id} {_short(stage.get('completed'), '0')}/{_short(total, '0')}"
-            + (f" failed {_short(stage.get('failed'), '0')}" if failed_count else "")
+            f"Initial progress: {phase}" + (f" - {detail}" if detail and include_run_details else "")
         )
-    provider_name = _short(provider.get("provider"), "")
-    model = _short(provider.get("model"), "")
-    if provider_name or model:
-        lines.append(f"Provider: {provider_name or 'unknown'} / {model or 'unknown'}")
+    if include_run_details:
+        stage_id = _short(stage.get("stage_id") or stage.get("call_name"), "")
+        total = stage.get("total")
+        if stage_id and total not in {None, ""}:
+            try:
+                failed_count = int(stage.get("failed") or 0)
+            except (TypeError, ValueError):
+                failed_count = 0
+            lines.append(
+                f"Stage: {stage_id} {_short(stage.get('completed'), '0')}/{_short(total, '0')}"
+                + (f" failed {_short(stage.get('failed'), '0')}" if failed_count else "")
+            )
+        provider_name = _short(provider.get("provider"), "")
+        model = _short(provider.get("model"), "")
+        if provider_name or model:
+            lines.append(f"Provider: {provider_name or 'unknown'} / {model or 'unknown'}")
     if staleness.get("stale"):
         age = _short(staleness.get("last_trace_age_seconds"), "unknown")
         lines.append(f"Attention: run appears stalled; no trace progress for {age}s")
-    if payload.get("terminal") is False:
-        lines.append("Watch: still running")
-    elif payload.get("terminal") is True:
-        lines.append("Watch: terminal")
+    if include_run_details:
+        if payload.get("terminal") is False:
+            lines.append("Watch: still running")
+        elif payload.get("terminal") is True:
+            lines.append("Watch: terminal")
     return "\n".join(lines)
 
 
@@ -1794,7 +1804,7 @@ def _workflow_run_id(payload: Any) -> str:
     return str(payload.get("run_id") or run.get("run_id") or "")
 
 
-def _workflow_status_text(prefix: str, payload: Any) -> str:
+def _workflow_status_text(prefix: str, payload: Any, *, include_run_details: bool = True) -> str:
     if isinstance(payload, dict) and payload.get("error"):
         return f"{prefix}\n{payload['error']}"
     if not isinstance(payload, dict):
@@ -1804,12 +1814,12 @@ def _workflow_status_text(prefix: str, payload: Any) -> str:
         f"Status: {_short(payload.get('status'))}",
     ]
     run_id = _workflow_run_id(payload)
-    if run_id:
+    if run_id and include_run_details:
         lines.append(f"Run: {run_id}")
     if payload.get("started") is not None:
         lines.append(f"Started: {_short(payload.get('started'))}")
     follow = payload.get("followthrough_contract") if isinstance(payload.get("followthrough_contract"), dict) else {}
-    if follow:
+    if follow and include_run_details:
         lines.append(f"Next: {_short(follow.get('recommended_next_action'))}")
     if isinstance(payload.get("readiness"), dict):
         lines.append("Readiness: " + _short(payload["readiness"].get("status")))

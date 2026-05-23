@@ -962,10 +962,14 @@ def test_run_command_previews_and_starts_with_confirmed_envelope(monkeypatch):
 
     assert started == {"action": "skip", "reason": "kb_journeys"}
     assert "Workflow start result" in adapter.sent[1]["text"]
-    assert "gen-123" in adapter.sent[1]["text"]
-    assert "Initial progress: Classifying - entity_admission" in adapter.sent[1]["text"]
-    assert "Stage: entity_admission 0/1" in adapter.sent[1]["text"]
-    assert "Provider: plugin:openai-compatible / gpt-5.5" in adapter.sent[1]["text"]
+    assert "Run:" not in adapter.sent[1]["text"]
+    assert "gen-123" not in adapter.sent[1]["text"]
+    assert "Initial progress: Classifying" in adapter.sent[1]["text"]
+    assert "Stage:" not in adapter.sent[1]["text"]
+    assert "Provider:" not in adapter.sent[1]["text"]
+    assert "plugin:openai-compatible" not in adapter.sent[1]["text"]
+    assert "gpt-5.5" not in adapter.sent[1]["text"]
+    assert "watch_until_terminal" not in adapter.sent[1]["text"]
     assert ctx.calls[-2][0] == "mcp_kb_engine_prod_workflow_start_confirmed"
     assert ctx.calls[-1] == (
         "mcp_kb_engine_prod_run_watch",
