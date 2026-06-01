@@ -864,12 +864,11 @@ def test_kbqueue_bare_reply_uses_visible_iterative_item_state(monkeypatch, tmp_p
             "note": "Previewed from Telegram iterative queue reply for GTC Taipei 2026",
         },
     )
-    assert ctx.calls[1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
-    assert ctx.calls[1][1]["proposal_ids"] == ["act_gtc"]
+    assert len(ctx.calls) == 1
     assert "act_huang1" not in json.dumps(ctx.calls)
     assert adapter.sent
     assert "GTC Taipei 2026" in adapter.sent[0]["text"]
-    assert "WG Agents" in adapter.sent[0]["text"]
+    assert "To apply: /kb queue archive 1 confirm" in adapter.sent[0]["text"]
 
 
 def test_kbqueue_bare_reply_records_options_presented_as_pending_action(monkeypatch, tmp_path):
@@ -920,9 +919,9 @@ def test_kbqueue_bare_reply_records_options_presented_as_pending_action(monkeypa
     assert ctx.calls[0][0] == "mcp_kb_engine_prod_queue_decision_preview"
     assert ctx.calls[0][1]["proposal_ids"] == ["act_hitachi"]
     assert ctx.calls[0][1]["decision"] == "reject"
-    assert ctx.calls[1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
-    assert ctx.calls[1][1]["proposal_ids"] == ["act_hitachi"]
+    assert len(ctx.calls) == 1
     assert "Hitachi" in adapter.sent[0]["text"]
+    assert "To apply: /kb queue reject 1 confirm" in adapter.sent[0]["text"]
 
 
 def test_kbqueue_pending_action_exposes_scoped_mcp_tools(monkeypatch, tmp_path):
@@ -943,12 +942,7 @@ def test_kbqueue_pending_action_exposes_scoped_mcp_tools(monkeypatch, tmp_path):
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-posture",
         message="Reject",
-    ) == {
-        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
-        "mcp_kb_engine_prod_queue_decide_confirmed",
-        "mcp_kb_engine_prod_queue_decisions_confirmed",
-        "mcp_kb_engine_prod_queue_decision_preview",
-    }
+    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-posture",
         message="keep me posted",

@@ -1579,10 +1579,9 @@ def scoped_mcp_tool_allowlist_for_message(
     """Return exact MCP tools allowed by a matched pending queue action.
 
     This is the stateful bridge between Telegram action cards and the generic
-    MCP posture filter.  A bare reply such as ``Reject`` should not globally
-    expose confirmed tools.  It may expose only the queue preview/confirmed
-    tools when there is fresh queue state for the current gateway session and
-    the reply is one of the choices shown for that visible item.
+    MCP posture filter.  A bare reply such as ``Reject`` should stay preview
+    only.  Confirmed queue tools are reserved for explicit confirm commands or
+    action-card confirmation gestures.
     """
     decision = _bare_queue_reply_decision(message)
     if decision not in QUEUE_REPLY_TOOL_DECISIONS:
@@ -1594,12 +1593,7 @@ def scoped_mcp_tool_allowlist_for_message(
     if choices and decision not in choices:
         return set()
     mcp_target = target or _mcp_target()
-    return {
-        _mcp_tool_name(mcp_target, "queue.decision_preview"),
-        _mcp_tool_name(mcp_target, "queue.decide_confirmed"),
-        _mcp_tool_name(mcp_target, "queue.batch_decide_confirmed"),
-        _mcp_tool_name(mcp_target, "queue.decisions_confirmed"),
-    }
+    return {_mcp_tool_name(mcp_target, "queue.decision_preview")}
 
 
 def _session_id_for_queue_reply_state(session_store: Any, source: Any) -> str:
@@ -1786,7 +1780,6 @@ def _render_iterative_queue_reply_decision(
     actor = "telegram:operator"
     source = "Hermes Telegram iterative queue"
     preview_tool = _mcp_tool_name(target, "queue.decision_preview")
-    confirmed_tool = _mcp_tool_name(target, "queue.batch_decide_confirmed")
     preview_payload = _result_payload(
         ctx.dispatch_tool(
             preview_tool,
@@ -1799,42 +1792,10 @@ def _render_iterative_queue_reply_decision(
             },
         )
     )
-    if not _preview_allows_confirmation(preview_payload):
-        return {
-            "title": "KB Queue",
-            "text": _preview_text(decision, proposal_ids, preview_payload, selection=selection),
-            "actions": [],
-        }
-    confirmed_payload = _result_payload(
-        ctx.dispatch_tool(
-            confirmed_tool,
-            {
-                "proposal_ids": proposal_ids,
-                "decision": decision,
-                "actor": actor,
-                "source": source,
-                "session_id": session_id or f"telegram-kb-reply-{int(time.time())}",
-                "user_confirmation": {
-                    "confirmed": True,
-                    "surface": "telegram",
-                    "action": f"queue.{decision}",
-                    "preview_required": True,
-                    "confirmation_text": decision,
-                    "proposal_ids": proposal_ids,
-                },
-                "note": f"Confirmed from Telegram iterative queue reply for {title}",
-            },
-        )
-    )
-    text = _confirmed_text(decision, confirmed_payload, selection=selection, proposal_ids=proposal_ids)
-    text = text.replace("\nNext: /kb queue", "")
-    if isinstance(confirmed_payload, dict) and confirmed_payload.get("ok") is False:
-        return {"title": "KB Queue", "text": text, "actions": []}
-    data, errors = _queue_summary_payload(ctx, target, limit=5)
-    next_text = _iterative_queue_next_text(data, session_id=session_id)
-    if errors:
-        next_text += "\nQueue refresh warning: " + "; ".join(errors[:2])
-    return {"title": "KB Queue", "text": text.rstrip() + "\n\n" + next_text, "actions": []}
+    text = _preview_text(decision, proposal_ids, preview_payload, selection=selection)
+    if _preview_allows_confirmation(preview_payload):
+        text += f"\nTo apply: /kb queue {decision} 1 confirm"
+    return {"title": "KB Queue", "text": text, "actions": []}
 
 
 def _queue_summary_payload(ctx: Any, target: str, *, limit: int = 5) -> tuple[Any | None, list[str]]:
