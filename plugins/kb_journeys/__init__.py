@@ -339,7 +339,7 @@ def _todo_count_from_summary(summary: dict[str, Any]) -> Any:
 def _display_text(value: Any) -> str:
     text = _short(value, "")
     if text == "Review prioritized queue items through workbench.queue.":
-        return "Review prioritized TODO items; use /kb queue for proposal review."
+        return "Review prioritized attention items; use /kb queue for proposal review."
     return text
 
 
@@ -352,7 +352,7 @@ def _dashboard_section_title(section: dict[str, Any], summary: dict[str, Any]) -
         todo_count = _todo_count_from_summary(summary)
         legacy_queue_count = summary.get("queue_item_count")
         if proposal_count is None or (todo_count is not None and legacy_queue_count == todo_count):
-            return "TODO Focus"
+            return "Attention Queue"
         return "Proposal Queue"
     return title
 

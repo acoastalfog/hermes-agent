@@ -227,8 +227,8 @@ def test_kb_command_renders_live_dashboard_without_calling_todo_count_queue(monk
     assert "Publication: dirty" in text
     assert "TODOs 309" in text
     assert "Queue 309" not in text
-    assert "TODO Focus" in text
-    assert "Review prioritized TODO items" in text
+    assert "Attention Queue" in text
+    assert "Review prioritized attention items" in text
 
 
 def test_dashboard_command_prefers_live_dashboard_packet(monkeypatch):
