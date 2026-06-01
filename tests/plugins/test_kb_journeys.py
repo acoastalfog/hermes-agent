@@ -60,6 +60,21 @@ class FakeKbActionsAdapter(FakeAdapter):
         )
 
 
+class FailingKbActionsAdapter(FakeAdapter):
+    async def send_kb_actions(self, chat_id, text, actions, metadata=None, reply_to=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "actions": actions,
+                "metadata": metadata,
+                "reply_to": reply_to,
+                "failed_native_card": True,
+            }
+        )
+        return SimpleNamespace(success=False, error="button rendering unavailable")
+
+
 def _event(text="/kb"):
     return MessageEvent(
         text=text,
@@ -91,6 +106,24 @@ def _drain_scheduled_tasks():
         await asyncio.sleep(0)
 
     asyncio.run(_drain())
+
+
+def _advisory_guidance(summary="Use advisory guidance to reason about this KB action."):
+    return {
+        "packet_type": "kb_advisory_guidance",
+        "schema_version": 1,
+        "mode": "advisory_only",
+        "authority": "no_mutation_authority",
+        "llm_prompt": "kb.review_guidance",
+        "llm_invocation": "explicit_user_request_only",
+        "mutates_state": False,
+        "requires_preview_before_write": True,
+        "summary": summary,
+        "recommended_sequence": [
+            "Read the canonical KB context and evidence first.",
+            "Preview with the canonical preview tool before confirmation.",
+        ],
+    }
 
 
 def test_kbtoday_command_renders_attention_cockpit_with_native_adapter(monkeypatch):
@@ -262,6 +295,101 @@ def test_dashboard_command_prefers_live_dashboard_packet(monkeypatch):
     assert adapter.sent[0]["actions"] == []
 
 
+def test_dashboard_situation_descriptor_renders_readonly_action_button(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_dashboard_live": {
+                "result": {
+                    "surface": "dashboard.live",
+                    "summary": {
+                        "active_run_count": 0,
+                        "active_todo_count": 1,
+                        "publication_status": "clean",
+                        "readiness_status": "ready",
+                    },
+                    "sections": [
+                        {
+                            "id": "situations",
+                            "title": "Situations",
+                            "cards": [
+                                {
+                                    "id": "situation:acme-launch",
+                                    "kind": "situation",
+                                    "title": "Acme Launch Decision",
+                                    "detail": "Needs next-step guidance.",
+                                    "action_descriptors": [
+                                        {
+                                            "packet_type": "dashboard_action_descriptor",
+                                            "schema_version": 2,
+                                            "action_id": "open_situation",
+                                            "label": "Open situation",
+                                            "method": "object.context",
+                                            "mutation": "read_only",
+                                            "target_kind": "situation",
+                                            "target_ref": "situations/2026-05-acme-launch-decision",
+                                            "preview_tool": "object.context",
+                                            "params": {
+                                                "object_path": "situations/2026-05-acme-launch-decision/state.md"
+                                            },
+                                            "advisory_guidance": _advisory_guidance(
+                                                "Use advisory guidance to reason about the Acme Launch Decision."
+                                            ),
+                                            "dashboard_owned_write": False,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "refresh": {"ttl_seconds": 60},
+                }
+            },
+            "mcp_kb_engine_prod_object_context": {
+                "result": {
+                    "title": "Acme Launch Decision",
+                    "summary": "Choose the next launch note after reviewing stakeholder evidence.",
+                    "target_ref": "situations/2026-05-acme-launch-decision",
+                }
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert adapter.sent[0]["actions"]
+    action = adapter.sent[0]["actions"][0]
+    assert action.label == "Open situation"
+    guidance_action = adapter.sent[0]["actions"][1]
+    assert guidance_action.label == "Guidance"
+
+    card = action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(card):
+        card = asyncio.run(card)
+
+    assert "Acme Launch Decision" in card["text"]
+    assert "Choose the next launch note" in card["text"]
+    assert ctx.calls[-1] == (
+        "mcp_kb_engine_prod_object_context",
+        {"object_path": "situations/2026-05-acme-launch-decision/state.md"},
+    )
+
+    guidance_card = guidance_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(guidance_card):
+        guidance_card = asyncio.run(guidance_card)
+
+    assert "KB Situation Guidance" in guidance_card["text"]
+    assert "kb.review_guidance" in guidance_card["text"]
+    assert "no_mutation_authority" in guidance_card["text"]
+    assert "Advisory output never confirms" in guidance_card["text"]
+
+
 def test_plain_non_kb_commands_are_left_for_system_handlers(monkeypatch):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
@@ -330,6 +458,34 @@ def test_register_exposes_single_clear_kb_menu_command():
         "Use /kb in Telegram. Try: /kb queue, /kb status, /kb reasoning xhigh, /kb run sync."
     )
     assert "pre_gateway_dispatch" in ctx.hooks
+
+
+def test_send_card_falls_back_to_text_when_native_action_card_fails():
+    from plugins.kb_journeys import _send_card
+    from tools.kb_callback_registry import KbAction
+
+    adapter = FailingKbActionsAdapter()
+    asyncio.run(
+        _send_card(
+            adapter,
+            _event("/kb"),
+            {
+                "title": "KB Queue",
+                "text": "Review proposal",
+                "actions": [
+                    KbAction(label="Preview Reject", action_id="preview", handler=lambda _ctx: None),
+                    KbAction(label="Guidance", action_id="guidance", handler=lambda _ctx: None),
+                ],
+            },
+        )
+    )
+
+    assert len(adapter.sent) == 2
+    assert adapter.sent[0]["failed_native_card"] is True
+    assert adapter.sent[1]["text"] == "Review proposal\n\nActions: Preview Reject, Guidance"
+    assert adapter.sent[1]["reply_to"] == "m1"
+    assert adapter.sent[1]["metadata"]["thread_id"] == "topic-1"
+    assert adapter.sent[1]["metadata"]["telegram_dm_topic_reply_fallback"] is True
 
 
 def test_kb_root_queue_dashboard_is_text_first(monkeypatch):
@@ -473,6 +629,93 @@ def test_kbqueue_review_todo_item_shows_todo_native_actions(monkeypatch):
     assert "Demote priority: /kb queue demote 1" in text
     assert "Archive TODO: /kb queue archive 1" in text
     assert "/kb queue approve 1" not in text
+
+
+def test_kbqueue_review_item_renders_descriptor_preview_and_confirm_buttons(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "total": 1,
+                    "items": [
+                        {
+                            "item_id": "accounts/mistral",
+                            "title": "Mistral",
+                            "kind": "proposal_entity",
+                            "summary": "Admission: Mistral has Nemotron Coalition licensing coordination.",
+                            "raw": {"proposal_ids": ["act_2"]},
+                            "safe_actions": [
+                                {
+                                    "packet_type": "dashboard_action_descriptor",
+                                    "schema_version": 2,
+                                    "action_id": "review.entity_reject",
+                                    "label": "Reject",
+                                    "target_kind": "proposal_queue",
+                                    "target_ref": "accounts/mistral",
+                                    "preview_tool": "queue.decision_preview",
+                                    "confirm_tool": "queue.batch_decide_confirmed",
+                                    "params": {"proposal_ids": ["act_2"], "decision": "reject"},
+                                    "dashboard_owned_write": False,
+                                    "requires_canonical_tool": True,
+                                    "expected_result": "Preview first, then reject after confirmation.",
+                                    "confirmation_copy": "Confirm Reject after reviewing the preview.",
+                                    "advisory_guidance": _advisory_guidance(
+                                        "Use advisory guidance to reason about Reject before previewing."
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_queue_decision_preview": {
+                "result": {"status": "preview", "ok": True, "plan": {"summary": "Reject 1 proposal."}}
+            },
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": {
+                "result": {"status": "applied", "ok": True}
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb queue review 1"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert adapter.sent[0]["actions"]
+    guidance_action = adapter.sent[0]["actions"][0]
+    assert guidance_action.label == "Guidance"
+    guidance_card = guidance_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(guidance_card):
+        guidance_card = asyncio.run(guidance_card)
+    assert "KB Queue Guidance" in guidance_card["text"]
+    assert "Use advisory guidance to reason about Reject" in guidance_card["text"]
+    assert "kb.review_guidance" in guidance_card["text"]
+    assert "Advisory output never confirms" in guidance_card["text"]
+
+    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Preview Reject")
+    assert preview_action.label == "Preview Reject"
+
+    preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(preview_card):
+        preview_card = asyncio.run(preview_card)
+
+    assert "Queue reject preview" in preview_card["text"]
+    assert preview_card["actions"][0].label == "Confirm Reject"
+
+    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(confirm_card):
+        confirm_card = asyncio.run(confirm_card)
+
+    assert "Queue Reject Applied" in confirm_card["text"]
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[-1][1]["user_confirmation"]["confirmed"] is True
+    assert ctx.calls[-1][1]["user_confirmation"]["preview_required"] is True
 
 
 def test_kbqueue_decision_can_be_previewed_and_confirmed_by_text_command(monkeypatch):
@@ -867,13 +1110,115 @@ def test_kb_publish_previews_without_committing(monkeypatch):
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    assert ctx.calls == [("mcp_kb_engine_prod_publication_preview_commit", {"message": "Publish KB update"})]
+    assert ctx.calls == [
+        ("mcp_kb_engine_prod_closeout_packet", {"limit": 5}),
+        ("mcp_kb_engine_prod_publication_preview_commit", {"message": "Publish KB update"}),
+    ]
     text = adapter.sent[0]["text"]
     assert "KB Publish Preview" in text
     assert "Changed paths: 2" in text
     assert "accounts/mistral/state.md" in text
     assert "To publish: /kb publish confirm" in text
     assert "No commit or push has been made." in text
+
+
+def test_kb_publish_renders_descriptor_confirm_action_button(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_closeout_packet": {
+                "result": {
+                    "packet_type": "closeout.packet",
+                    "contract_id": "kb.closeout.operation.v1",
+                    "action_descriptors": [
+                        {
+                            "packet_type": "dashboard_action_descriptor",
+                            "schema_version": 2,
+                            "action_id": "publication.preview_commit",
+                            "label": "Preview publication commit",
+                            "method": "publication.preview_commit",
+                            "mutation": "read_only",
+                            "target_kind": "publication",
+                            "target_ref": "publication",
+                            "preview_tool": "publication.preview_commit",
+                            "confirm_tool": "",
+                            "params": {"message": "Publish KB update"},
+                            "dashboard_owned_write": False,
+                            "requires_canonical_tool": True,
+                        },
+                        {
+                            "packet_type": "dashboard_action_descriptor",
+                            "schema_version": 2,
+                            "action_id": "publication.commit_confirmed",
+                            "label": "Confirm publication commit",
+                            "method": "publication.commit_confirmed",
+                            "mutation": "workspace_write",
+                            "target_kind": "publication",
+                            "target_ref": "publication",
+                            "preview_tool": "publication.preview_commit",
+                            "confirm_tool": "publication.commit_confirmed",
+                            "params": {"message": "Publish KB update"},
+                            "dashboard_owned_write": False,
+                            "requires_canonical_tool": True,
+                            "confirmation_copy": "Confirm publication only after reviewing the commit preview.",
+                        },
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_publication_preview_commit": {
+                "result": {
+                    "status": "ready",
+                    "ok": True,
+                    "message": "Publish KB update",
+                    "changed_paths": ["accounts/mistral/state.md"],
+                    "git": {"branch": "main", "head": "abc123", "upstream": "origin/main"},
+                }
+            },
+            "mcp_kb_engine_prod_publication_commit_confirmed": {
+                "result": {
+                    "status": "committed",
+                    "ok": True,
+                    "publication": {
+                        "status": "committed",
+                        "changed_paths": ["accounts/mistral/state.md"],
+                        "commit": "def456",
+                    },
+                }
+            },
+            "mcp_kb_engine_prod_publication_push_confirmed": {
+                "result": {"status": "pushed", "ok": True, "publication": {"status": "pushed"}},
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb publish"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert adapter.sent[0]["actions"]
+    confirm_action = adapter.sent[0]["actions"][0]
+    assert confirm_action.label == "Confirm Publish"
+
+    confirm_card = confirm_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(confirm_card):
+        confirm_card = asyncio.run(confirm_card)
+
+    assert "KB Published" in confirm_card["text"]
+    assert [call[0] for call in ctx.calls] == [
+        "mcp_kb_engine_prod_closeout_packet",
+        "mcp_kb_engine_prod_publication_preview_commit",
+        "mcp_kb_engine_prod_publication_preview_commit",
+        "mcp_kb_engine_prod_publication_commit_confirmed",
+        "mcp_kb_engine_prod_publication_push_confirmed",
+    ]
+    commit_args = ctx.calls[-2][1]
+    assert commit_args["user_confirmation"]["confirmed"] is True
+    assert commit_args["user_confirmation"]["preview_required"] is True
+    assert commit_args["expected_changed_paths"] == ["accounts/mistral/state.md"]
 
 
 def test_kb_publish_confirm_commits_and_pushes_after_fresh_preview(monkeypatch):
@@ -919,11 +1264,12 @@ def test_kb_publish_confirm_commits_and_pushes_after_fresh_preview(monkeypatch):
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     assert [call[0] for call in ctx.calls] == [
+        "mcp_kb_engine_prod_closeout_packet",
         "mcp_kb_engine_prod_publication_preview_commit",
         "mcp_kb_engine_prod_publication_commit_confirmed",
         "mcp_kb_engine_prod_publication_push_confirmed",
     ]
-    commit_args = ctx.calls[1][1]
+    commit_args = ctx.calls[2][1]
     assert commit_args["expected_git_head"] == "abc123"
     assert commit_args["expected_changed_paths"] == ["accounts/mistral/state.md"]
     assert commit_args["user_confirmation"]["confirmed"] is True
@@ -960,7 +1306,10 @@ def test_kb_publish_confirm_noops_when_preview_has_no_changes(monkeypatch):
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    assert ctx.calls == [("mcp_kb_engine_prod_publication_preview_commit", {"message": "Publish KB update"})]
+    assert ctx.calls == [
+        ("mcp_kb_engine_prod_closeout_packet", {"limit": 5}),
+        ("mcp_kb_engine_prod_publication_preview_commit", {"message": "Publish KB update"}),
+    ]
     assert "Nothing to publish" in adapter.sent[0]["text"]
 
 
