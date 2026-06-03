@@ -589,7 +589,90 @@ def _render_request_receipt_packet(
     if packet.get("restore_available") is True:
         lines.append("Restore: preview available")
     action = _restore_action_from_receipt(ctx, target, packet)
+    next_review = _next_review_packet(packet)
+    if next_review:
+        status = _short(next_review.get("status"), "")
+        if route.startswith("queue.") and status == "ready":
+            next_payload = _queue_payload_from_next_review(next_review)
+            next_card = _render_queue(
+                next_payload,
+                ctx=ctx,
+                target=target,
+                session_id=_review_session_id({"review_session": next_review.get("review_session")})
+                or _short(next_review.get("source_review_session_id"), ""),
+            )
+            actions = list(next_card.get("actions") or [])
+            if action and len(actions) < 6:
+                actions.append(action)
+            return {
+                "title": "KB Review",
+                "text": "\n".join([*lines, "", "Next review from kb-engine:", next_card["text"]]),
+                "actions": actions,
+            }
+        lines.extend(_next_review_lines(next_review))
     return {"title": title, "text": "\n".join(lines), "actions": [action] if action else []}
+
+
+def _next_review_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    next_review = packet.get("next_review")
+    if isinstance(next_review, dict) and next_review.get("packet_type") == "guided_kb_review_next":
+        return dict(next_review)
+    return {}
+
+
+def _next_review_lines(next_review: dict[str, Any]) -> list[str]:
+    status = _short(next_review.get("status"), "")
+    reason = _short(next_review.get("reason"), "")
+    if status == "no_more_items":
+        return ["Next review: no more proposal items."]
+    if status in {"changed_queue", "stale_cursor", "preview_lease_required", "refresh_required"}:
+        line = "Next review: refresh required"
+        if reason:
+            line += f" ({_clip(reason, 160)})"
+        return [line]
+    if status == "unavailable":
+        line = "Next review: unavailable"
+        if reason:
+            line += f" ({_clip(reason, 160)})"
+        return [line]
+    if status == "ready":
+        target = next_review.get("target") if isinstance(next_review.get("target"), dict) else {}
+        title = _short(target.get("title"), "next item")
+        proposal_count = len(_id_list(target.get("proposal_ids")))
+        suffix = f" · {proposal_count} proposal{'s' if proposal_count != 1 else ''}" if proposal_count else ""
+        return [f"Next review: {title}{suffix}"]
+    return [f"Next review: {status or 'unknown'}"]
+
+
+def _queue_payload_from_next_review(next_review: dict[str, Any]) -> dict[str, Any]:
+    target = next_review.get("target") if isinstance(next_review.get("target"), dict) else {}
+    proposal_ids = _id_list(target.get("proposal_ids"))
+    review_session = next_review.get("review_session") if isinstance(next_review.get("review_session"), dict) else {}
+    item = {
+        "item_id": _short(target.get("target_id"), ""),
+        "kind": _short(target.get("kind"), "proposal_entity"),
+        "title": _short(target.get("title"), "Next review"),
+        "summary": _short(target.get("summary"), ""),
+        "status": _short(target.get("status"), ""),
+        "entity_path": _short(target.get("entity_path"), ""),
+        "safe_actions": target.get("safe_actions") if isinstance(target.get("safe_actions"), list) else [],
+        "review_session": review_session,
+        "raw": {
+            "proposal_ids": proposal_ids,
+            "proposal_count": int(target.get("proposal_count") or len(proposal_ids)),
+            "sections": target.get("sections") if isinstance(target.get("sections"), list) else [],
+            "review_session": review_session,
+        },
+    }
+    return {
+        "packet_type": "workbench.queue",
+        "schema_version": 1,
+        "total": 1,
+        "offset": 0,
+        "next_offset": None,
+        "items": [item],
+        "review_session": review_session,
+    }
 
 
 def _render_supported_result_packet(
@@ -2094,7 +2177,27 @@ def _queue_descriptor_call_args(
     args["actor"] = actor
     args["source"] = source
     args["note"] = note
+    review_metadata = _queue_item_review_metadata(item)
+    _apply_queue_preview_metadata(args, review_metadata)
+    review_session_id = _review_session_id(review_metadata)
+    if review_session_id:
+        args.setdefault("session_id", review_session_id)
     return args
+
+
+def _queue_item_review_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    for candidate in (item.get("preview_lease"), raw.get("preview_lease")):
+        if isinstance(candidate, dict) and candidate:
+            metadata["preview_lease"] = dict(candidate)
+            break
+    for candidate in (item.get("review_session"), raw.get("review_session")):
+        if isinstance(candidate, dict) and candidate:
+            metadata["review_session"] = dict(candidate)
+            metadata["preview_session"] = dict(candidate)
+            break
+    return metadata
 
 
 def _queue_callback_actor(callback_ctx: Any) -> str:
