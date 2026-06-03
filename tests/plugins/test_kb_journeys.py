@@ -710,7 +710,7 @@ def test_send_card_falls_back_to_text_when_native_action_card_fails():
     assert adapter.sent[1]["metadata"]["telegram_dm_topic_reply_fallback"] is True
 
 
-def test_kb_root_queue_dashboard_is_text_first(monkeypatch):
+def test_kb_root_queue_dashboard_starts_guided_first_item(monkeypatch):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
     monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
@@ -748,9 +748,131 @@ def test_kb_root_queue_dashboard_is_text_first(monkeypatch):
     assert "Admit Stanford DAS Lab" in text
     assert "Target: accounts/stanford-das-lab" in text
     assert "Review: /kb queue review 1" in text
-    assert "Then preview a listed action, for example: /kb queue reject 1" in text
-    assert adapter.sent[0]["actions"] == []
+    assert "Reviewing item 1 now" in text
+    assert "Decision buttons open previews" in text
+    assert "Text fallback: /kb queue reject 1" in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details"]
     assert adapter.sent[0]["reply_to"] == "m1"
+
+
+def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
+    from plugins import kb_journeys
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "total": 2,
+                    "items": [
+                        {
+                            "item_id": "accounts/mistral",
+                            "title": "Mistral",
+                            "kind": "proposal_entity",
+                            "summary": "Admission: Mistral has licensing coordination.",
+                            "raw": {"proposal_ids": ["act_2"]},
+                            "safe_actions": [
+                                {
+                                    "packet_type": "dashboard_action_descriptor",
+                                    "schema_version": 2,
+                                    "action_id": "review.entity_reject",
+                                    "label": "Reject",
+                                    "target_kind": "proposal_queue",
+                                    "target_ref": "accounts/mistral",
+                                    "preview_tool": "queue.decision_preview",
+                                    "confirm_tool": "queue.batch_decide_confirmed",
+                                    "params": {"proposal_ids": ["act_2"], "decision": "reject"},
+                                    "dashboard_owned_write": False,
+                                    "requires_canonical_tool": True,
+                                    "advisory_guidance": _advisory_guidance(
+                                        "Use advisory guidance to reason about Reject before previewing."
+                                    ),
+                                }
+                            ],
+                        },
+                        {
+                            "item_id": "accounts/keio-university",
+                            "title": "Keio University",
+                            "kind": "proposal_entity",
+                            "summary": "Admission: Keio has a healthcare AI PoC.",
+                            "raw": {"proposal_ids": ["act_3"]},
+                        },
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_queue_decision_preview": {
+                "result": {"status": "preview", "ok": True, "plan": {"summary": "Reject 1 proposal."}}
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+    store = FakeSessionStore("session-guided")
+
+    result = hook(event=_event("/kb queue"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    text = adapter.sent[0]["text"]
+    assert "Reviewing item 1 now" in text
+    assert "Decision buttons open previews" in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details", "Guidance", "Reject", "Skip"]
+    assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
+        session_id="session-guided",
+        message="Reject",
+    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
+
+    preview_card = adapter.sent[0]["actions"][2].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(preview_card):
+        preview_card = asyncio.run(preview_card)
+
+    assert "Queue reject preview" in preview_card["text"]
+    assert preview_card["actions"][0].label == "Confirm Reject"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-1][1]["proposal_ids"] == ["act_2"]
+
+    skip_card = adapter.sent[0]["actions"][3].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(skip_card):
+        skip_card = asyncio.run(skip_card)
+
+    assert "Skipped item 1 locally. No KB state changed." in skip_card["text"]
+    assert "Queue Item 2" in skip_card["text"]
+    assert "Keio University" in skip_card["text"]
+
+
+def test_kb_review_without_index_starts_guided_queue(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "total": 1,
+                    "items": [
+                        {
+                            "item_id": "accounts/mistral",
+                            "title": "Mistral",
+                            "raw": {"proposal_ids": ["act_2"]},
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb review"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls == [("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5})]
+    assert "KB Queue" in adapter.sent[0]["text"]
+    assert "Reviewing item 1 now" in adapter.sent[0]["text"]
+    assert "Use /kb queue to list proposals." not in adapter.sent[0]["text"]
 
 
 def test_kbqueue_review_item_can_be_opened_by_text_command(monkeypatch):
@@ -919,8 +1041,8 @@ def test_kbqueue_review_item_renders_descriptor_preview_and_confirm_buttons(monk
     assert "kb.review_guidance" in guidance_card["text"]
     assert "Advisory output never confirms" in guidance_card["text"]
 
-    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Preview Reject")
-    assert preview_action.label == "Preview Reject"
+    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
+    assert preview_action.label == "Reject"
 
     preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(preview_card):
@@ -1016,7 +1138,7 @@ def test_kbqueue_descriptor_confirm_carries_lease_session_and_blocks_stale_resul
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Preview Reject")
+    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
 
     preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(preview_card):

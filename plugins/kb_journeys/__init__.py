@@ -1771,7 +1771,15 @@ def _descriptor_tool_name(target: str, tool_name: Any) -> str:
     return _mcp_tool_name(target, value)
 
 
-def _queue_descriptor_actions(ctx: Any, target: str, item: dict[str, Any], *, index: int) -> list[Any]:
+def _queue_descriptor_actions(
+    ctx: Any,
+    target: str,
+    item: dict[str, Any],
+    *,
+    index: int,
+    preview_label_prefix: bool = True,
+    limit: int | None = 4,
+) -> list[Any]:
     try:
         from tools.kb_callback_registry import KbAction
     except Exception:
@@ -1817,7 +1825,7 @@ def _queue_descriptor_actions(ctx: Any, target: str, item: dict[str, Any], *, in
         descriptor_copy = dict(descriptor)
         actions.append(
             KbAction(
-                label=f"Preview {label}",
+                label=f"Preview {label}" if preview_label_prefix else label,
                 action_id=f"{action_id}.preview",
                 handler=lambda callback_ctx, d=descriptor_copy: _render_queue_descriptor_preview(
                     ctx,
@@ -1836,7 +1844,9 @@ def _queue_descriptor_actions(ctx: Any, target: str, item: dict[str, Any], *, in
                 },
             )
         )
-    return actions[:4]
+    if limit is None:
+        return actions
+    return actions[:limit]
 
 
 def _queue_descriptor_call_args(
@@ -3266,8 +3276,101 @@ def _render_queue_item(data: Any, *, index: int, ctx: Any, target: str) -> dict[
     return {
         "title": "KB Queue",
         "text": _queue_item_text(item, index=index),
-        "actions": _queue_descriptor_actions(ctx, target, item, index=index),
+        "actions": _queue_descriptor_actions(
+            ctx,
+            target,
+            item,
+            index=index,
+            preview_label_prefix=False,
+            limit=6,
+        ),
     }
+
+
+def _render_queue_skip(
+    data: Any,
+    *,
+    index: int,
+    ctx: Any,
+    target: str,
+    session_id: str = "",
+) -> dict[str, Any]:
+    next_index = index + 1
+    next_item = _queue_item_at(data, next_index)
+    if next_item is None:
+        if session_id:
+            _clear_iterative_queue_reply_state(session_id)
+        return {
+            "title": "KB Queue",
+            "text": "KB Queue\nNo more items are visible in this Telegram window. Refresh with /kb queue.",
+            "actions": [],
+        }
+    _store_iterative_state_from_item(session_id, next_item)
+    card = _render_queue_item(data, index=next_index, ctx=ctx, target=target)
+    card["text"] = f"Skipped item {index} locally. No KB state changed.\n\n{card['text']}"
+    return card
+
+
+def _queue_guided_actions(
+    ctx: Any | None,
+    target: str | None,
+    data: Any,
+    *,
+    session_id: str = "",
+) -> list[Any]:
+    if ctx is None or not target:
+        return []
+    item = _queue_item_at(data, 1)
+    if item is None:
+        return []
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return []
+
+    actions: list[Any] = [
+        KbAction(
+            label="Details",
+            action_id="queue.details",
+            handler=lambda callback_ctx: _render_queue_item(data, index=1, ctx=ctx, target=target),
+            metadata={
+                "target_kind": "proposal_queue",
+                "target_ref": _item_target(item),
+                "review_index": 1,
+            },
+        )
+    ]
+    actions.extend(
+        _queue_descriptor_actions(
+            ctx,
+            target,
+            item,
+            index=1,
+            preview_label_prefix=False,
+            limit=None,
+        )
+    )
+    if _queue_item_at(data, 2) is not None:
+        actions.append(
+            KbAction(
+                label="Skip",
+                action_id="queue.skip",
+                handler=lambda callback_ctx: _render_queue_skip(
+                    data,
+                    index=1,
+                    ctx=ctx,
+                    target=target,
+                    session_id=session_id,
+                ),
+                metadata={
+                    "target_kind": "proposal_queue",
+                    "target_ref": _item_target(item),
+                    "review_index": 1,
+                    "mutates_state": False,
+                },
+            )
+        )
+    return actions[:6]
 
 
 def _render_queue_text_decision(
@@ -3738,7 +3841,6 @@ def _render_queue(
     target: str | None = None,
     session_id: str = "",
 ) -> dict[str, Any]:
-    del ctx, target
     if isinstance(data, str):
         return {"title": "KB Queue", "text": f"KB Queue\n{data}", "actions": []}
     count = None
@@ -3747,6 +3849,10 @@ def _render_queue(
     items = _items(data, ("items",), ("proposals",), ("queue", "items"))
     visible_items = items[:5]
     _store_visible_queue_scope(session_id, visible_items)
+    if visible_items and isinstance(visible_items[0], dict):
+        _store_iterative_state_from_item(session_id, visible_items[0])
+    elif session_id:
+        _clear_iterative_queue_reply_state(session_id)
     lines = ["KB Queue"]
     if count is not None:
         lines.append(f"{count} pending")
@@ -3770,12 +3876,13 @@ def _render_queue(
             lines.append(f"{idx}. {_short(item)}")
     if items:
         lines.append("")
-        lines.append("Review one: /kb queue review 1")
-        lines.append("Then preview a listed action, for example: /kb queue reject 1")
+        lines.append("Reviewing item 1 now. Decision buttons open previews; nothing applies until Confirm.")
+        lines.append("Reply with a listed decision for item 1, or reply Reject all for the visible window.")
+        lines.append("Text fallback: /kb queue reject 1")
         lines.append("Batch: /kb queue reject 1,2")
         lines.append("Visible batch: reply Reject all to preview only the items shown here")
         lines.append("Confirm from the preview button when available; text fallback: /kb queue reject 1 confirm")
-    return {"title": "KB Queue", "text": "\n".join(lines), "actions": []}
+    return {"title": "KB Queue", "text": "\n".join(lines), "actions": _queue_guided_actions(ctx, target, data, session_id=session_id)}
 
 
 def _kb_root_command(args: str) -> tuple[str, str]:
@@ -3800,7 +3907,7 @@ def _kb_root_command(args: str) -> tuple[str, str]:
     if key in {"queue", "q"}:
         return "kbqueue", rest
     if key == "review":
-        return "kbqueue", f"review {rest}".strip()
+        return "kbqueue", f"review {rest}".strip() if rest else ""
     if key in {"publish", "publication"}:
         return "kbpublish", rest
     if key in {"run", "workflow"}:
