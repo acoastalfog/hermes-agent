@@ -28,6 +28,7 @@ KB_REASONING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 QUEUE_REPLY_DECISIONS = {"approve", "reject", "archive", "skip", "complete", "keep", "demote", "detail"}
 QUEUE_REPLY_TOOL_DECISIONS = {"approve", "reject", "archive", "skip", "complete", "keep", "demote"}
 QUEUE_REPLY_STATE_TTL_SECONDS = 15 * 60
+QUEUE_SCOPE_STATE_TTL_SECONDS = 15 * 60
 MEETING_HANDOFF_STATE_TTL_SECONDS = 15 * 60
 SUPPORTED_RESULT_PACKET_TYPES = {
     "durable_graph_validation",
@@ -54,6 +55,12 @@ def _queue_reply_state_path():
     return get_hermes_home() / "state" / "kb_queue_reply_state.json"
 
 
+def _queue_scope_state_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "kb_queue_scope_state.json"
+
+
 def _meeting_handoff_state_path():
     from hermes_constants import get_hermes_home
 
@@ -76,6 +83,24 @@ def _save_queue_reply_states(states: dict[str, Any]) -> None:
         path.write_text(json.dumps(states, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     except OSError:
         logger.debug("kb_journeys: failed to persist iterative queue state", exc_info=True)
+
+
+def _load_queue_scope_states() -> dict[str, Any]:
+    path = _queue_scope_state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_queue_scope_states(states: dict[str, Any]) -> None:
+    path = _queue_scope_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(states, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        logger.debug("kb_journeys: failed to persist queue scope state", exc_info=True)
 
 
 def _load_meeting_handoff_states() -> dict[str, Any]:
@@ -1589,6 +1614,145 @@ def _proposal_ids_for_selection(selection: list[tuple[int, dict[str, Any]]]) -> 
     return proposal_ids
 
 
+def _queue_selection_snapshot(selection: list[tuple[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for index, item in selection:
+        snapshots.append(
+            {
+                "index": int(index),
+                "title": _item_title(item),
+                "kind": _item_kind(item),
+                "target": _item_target(item),
+                "detail": _item_detail(item),
+                "proposal_ids": _proposal_ids_for_item(item),
+            }
+        )
+    return snapshots
+
+
+def _queue_selection_from_snapshot(snapshots: Any) -> list[tuple[int, dict[str, Any]]]:
+    selection: list[tuple[int, dict[str, Any]]] = []
+    if not isinstance(snapshots, list):
+        return selection
+    for offset, snapshot in enumerate(snapshots, start=1):
+        if not isinstance(snapshot, dict):
+            continue
+        try:
+            index = int(snapshot.get("index") or offset)
+        except (TypeError, ValueError):
+            index = offset
+        proposal_ids = [str(item) for item in (snapshot.get("proposal_ids") or []) if str(item).strip()]
+        item = {
+            "title": _short(snapshot.get("title"), "Queue item"),
+            "kind": _short(snapshot.get("kind"), ""),
+            "target": _short(snapshot.get("target"), ""),
+            "detail": _short(snapshot.get("detail"), ""),
+            "raw": {"proposal_ids": proposal_ids},
+        }
+        selection.append((index, item))
+    return selection
+
+
+def _queue_scope_state(session_id: str, *, create: bool = False) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    states = _load_queue_scope_states()
+    if not session_id:
+        return states, None
+    state = states.get(session_id)
+    if not isinstance(state, dict):
+        if not create:
+            return states, None
+        state = {"schema_version": 1}
+        states[session_id] = state
+    return states, state
+
+
+def _queue_scope_stale(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return True
+    try:
+        recorded_at = float(record.get("recorded_at") or 0.0)
+    except (TypeError, ValueError):
+        return True
+    if recorded_at <= 0:
+        return True
+    return bool(time.time() - recorded_at > QUEUE_SCOPE_STATE_TTL_SECONDS)
+
+
+def _store_visible_queue_scope(session_id: str, items: list[Any]) -> None:
+    if not session_id:
+        return
+    selection = [(idx, item) for idx, item in enumerate(items, start=1) if isinstance(item, dict)]
+    states, state = _queue_scope_state(session_id, create=True)
+    if state is None:
+        return
+    state["visible"] = {
+        "kind": "visible_queue_window",
+        "recorded_at": time.time(),
+        "selection": _queue_selection_snapshot(selection),
+    }
+    _save_queue_scope_states(states)
+
+
+def _get_visible_queue_scope(session_id: str) -> list[tuple[int, dict[str, Any]]]:
+    states, state = _queue_scope_state(session_id)
+    if state is None:
+        return []
+    visible = state.get("visible")
+    if _queue_scope_stale(visible):
+        state.pop("visible", None)
+        _save_queue_scope_states(states)
+        return []
+    return _queue_selection_from_snapshot(visible.get("selection"))
+
+
+def _store_queue_text_preview_scope(
+    session_id: str,
+    *,
+    decision: str,
+    indices: list[int],
+    selection: list[tuple[int, dict[str, Any]]],
+) -> None:
+    if not session_id:
+        return
+    states, state = _queue_scope_state(session_id, create=True)
+    if state is None:
+        return
+    state["preview"] = {
+        "kind": "queue_text_preview",
+        "recorded_at": time.time(),
+        "decision": str(decision or "").strip().lower(),
+        "indices": [int(index) for index in indices],
+        "selection": _queue_selection_snapshot(selection),
+        "proposal_ids": _proposal_ids_for_selection(selection),
+    }
+    _save_queue_scope_states(states)
+
+
+def _get_queue_text_preview_scope(
+    session_id: str,
+    *,
+    decision: str,
+    indices: list[int],
+) -> list[tuple[int, dict[str, Any]]]:
+    states, state = _queue_scope_state(session_id)
+    if state is None:
+        return []
+    preview = state.get("preview")
+    if _queue_scope_stale(preview):
+        state.pop("preview", None)
+        _save_queue_scope_states(states)
+        return []
+    if str(preview.get("decision") or "").strip().lower() != str(decision or "").strip().lower():
+        return []
+    try:
+        recorded_indices = [int(index) for index in (preview.get("indices") or [])]
+    except (TypeError, ValueError):
+        recorded_indices = []
+    if recorded_indices != [int(index) for index in indices]:
+        return []
+    return _queue_selection_from_snapshot(preview.get("selection"))
+
+
 def _preview_text(
     decision: str,
     proposal_ids: list[str],
@@ -1851,6 +2015,21 @@ def _bare_queue_reply_decision(text: str) -> str:
     return lowered if lowered in QUEUE_REPLY_DECISIONS else ""
 
 
+def _visible_scope_all_decision(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    match = re.match(r"^(approve|reject|archive|skip)\b", lowered)
+    if not match:
+        return ""
+    rest = lowered[match.end() :].strip()
+    if not rest:
+        return ""
+    if re.search(r"\b(all|these|shown|visible|listed|everything)\b", rest):
+        return match.group(1)
+    if re.search(r"\b(?:the\s+)?(?:\d+|five)\b.*\b(showed|shown|presented|listed|visible|items?|proposals?)\b", rest):
+        return match.group(1)
+    return ""
+
+
 def scoped_mcp_tool_allowlist_for_message(
     *,
     session_id: str,
@@ -1866,13 +2045,18 @@ def scoped_mcp_tool_allowlist_for_message(
     """
     decision = _bare_queue_reply_decision(message)
     if decision not in QUEUE_REPLY_TOOL_DECISIONS:
-        return set()
-    state = _get_iterative_queue_reply_state(session_id)
-    if not state:
-        return set()
-    choices = {str(choice).strip().lower() for choice in (state.get("choices") or []) if str(choice).strip()}
-    if choices and decision not in choices:
-        return set()
+        decision = _visible_scope_all_decision(message)
+        if decision not in QUEUE_REPLY_TOOL_DECISIONS:
+            return set()
+        if not _get_visible_queue_scope(session_id):
+            return set()
+    else:
+        state = _get_iterative_queue_reply_state(session_id)
+        if not state:
+            return set()
+        choices = {str(choice).strip().lower() for choice in (state.get("choices") or []) if str(choice).strip()}
+        if choices and decision not in choices:
+            return set()
     mcp_target = target or _mcp_target()
     return {_mcp_tool_name(mcp_target, "queue.decision_preview")}
 
@@ -2076,6 +2260,56 @@ def _render_iterative_queue_reply_decision(
     text = _preview_text(decision, proposal_ids, preview_payload, selection=selection)
     if _preview_allows_confirmation(preview_payload):
         text += f"\nTo apply: /kb queue {decision} 1 confirm"
+    return {"title": "KB Queue", "text": text, "actions": []}
+
+
+def _render_visible_scope_all_decision(
+    ctx: Any,
+    target: str,
+    *,
+    session_id: str,
+    decision: str,
+) -> dict[str, Any]:
+    selection = _get_visible_queue_scope(session_id)
+    if not selection:
+        return {
+            "title": "KB Queue",
+            "text": (
+                "KB Queue\n"
+                f"I can only {decision} all against the proposals currently shown in this Telegram thread. "
+                "Run /kb queue first, then ask again."
+            ),
+            "actions": [],
+        }
+    proposal_ids = _proposal_ids_for_selection(selection)
+    if not proposal_ids:
+        return {"title": "KB Queue", "text": "KB Queue\nThe visible queue window did not include proposal ids.", "actions": []}
+    actor = "telegram:operator"
+    source = "Hermes Telegram visible queue"
+    preview_tool = _mcp_tool_name(target, "queue.decision_preview")
+    preview_payload = _result_payload(
+        ctx.dispatch_tool(
+            preview_tool,
+            {
+                "proposal_ids": proposal_ids,
+                "decision": decision,
+                "actor": actor,
+                "source": source,
+                "note": f"Previewed from Telegram visible queue scope for {len(selection)} shown item(s)",
+            },
+        )
+    )
+    text = _preview_text(decision, proposal_ids, preview_payload, selection=selection)
+    text += "\nScope: visible Telegram queue window only, not the full pending queue."
+    if _preview_allows_confirmation(preview_payload):
+        indices = [index for index, _ in selection]
+        _store_queue_text_preview_scope(
+            session_id,
+            decision=decision,
+            indices=indices,
+            selection=selection,
+        )
+        text += f"\nTo apply: /kb queue {decision} {_format_indices(indices)} confirm"
     return {"title": "KB Queue", "text": text, "actions": []}
 
 
@@ -2536,8 +2770,8 @@ def _queue_command_help() -> dict[str, Any]:
                 "Use /kb queue review 1 to inspect one item.",
                 "Use /kb queue reject 1 to preview a decision.",
                 "Use /kb queue complete 1 for a TODO-backed proposal.",
-                "Use /kb queue reject 1 confirm to apply it.",
-                "Use /kb queue reject 1,2 confirm to apply the same decision to multiple items.",
+                "Use /kb queue reject 1 confirm only after that exact Telegram preview.",
+                "Reply Reject all to preview only the queue items currently shown in Telegram.",
             ]
         ),
         "actions": [],
@@ -2568,15 +2802,34 @@ def _render_queue_text_decision(
     indices: list[int],
     decision: str,
     confirm: bool,
+    session_id: str = "",
 ) -> dict[str, Any]:
-    selection, missing = _queue_items_at(data, indices)
-    if not selection:
-        total = len(_queue_items_from_payload(data))
-        return {
-            "title": "KB Queue",
-            "text": f"KB Queue\nNo selected items in the current queue window ({total} shown). Use /kb queue to refresh.",
-            "actions": [],
-        }
+    if confirm:
+        selection = _get_queue_text_preview_scope(session_id, decision=decision, indices=indices)
+        missing: list[int] = []
+        if not selection:
+            return {
+                "title": "KB Queue",
+                "text": (
+                    "KB Queue\n"
+                    "That confirmation is not tied to a current Telegram preview. "
+                    "Preview the exact item(s) again, then confirm from that preview."
+                ),
+                "actions": [],
+            }
+    else:
+        selection, missing = _queue_items_at(data, indices)
+        if not selection:
+            total = len(_queue_items_from_payload(data))
+            return {
+                "title": "KB Queue",
+                "text": f"KB Queue\nNo selected items in the current queue window ({total} shown). Use /kb queue to refresh.",
+                "actions": [],
+            }
+        if missing:
+            # Partial selections can be previewed, but the stored confirmation
+            # lease only covers the concrete items that were actually shown.
+            pass
     proposal_ids = _proposal_ids_for_selection(selection)
     if not proposal_ids:
         return {"title": "KB Queue", "text": "No proposal ids were available for the selected queue item(s).", "actions": []}
@@ -2603,6 +2856,12 @@ def _render_queue_text_decision(
         if missing:
             text += "\nMissing queue item(s): " + ", ".join(str(index) for index in missing)
         if _preview_allows_confirmation(preview_payload):
+            _store_queue_text_preview_scope(
+                session_id,
+                decision=decision,
+                indices=[index for index, _ in selection],
+                selection=selection,
+            )
             text += f"\nTo apply: /kb queue {decision} {index_text} confirm"
         return {"title": "KB Queue", "text": text, "actions": []}
     if not _preview_allows_confirmation(preview_payload):
@@ -2626,6 +2885,7 @@ def _render_queue_text_decision(
                     "action": f"queue.{decision}",
                     "preview_required": True,
                     "confirmation_text": f"/kb queue {decision} {index_text} confirm",
+                    "proposal_ids": proposal_ids,
                 },
                 "note": f"Confirmed from Telegram /kb queue text command for {selected_titles}",
             },
@@ -2954,19 +3214,28 @@ def _render_workflow_plan(
     return {"title": "Workflow", "text": "\n".join(lines), "actions": []}
 
 
-def _render_queue(data: Any, *, ctx: Any | None = None, target: str | None = None) -> dict[str, Any]:
+def _render_queue(
+    data: Any,
+    *,
+    ctx: Any | None = None,
+    target: str | None = None,
+    session_id: str = "",
+) -> dict[str, Any]:
+    del ctx, target
     if isinstance(data, str):
         return {"title": "KB Queue", "text": f"KB Queue\n{data}", "actions": []}
     count = None
     if isinstance(data, dict):
         count = data.get("total") or data.get("count") or _count_from(data, "queue", "proposals")
     items = _items(data, ("items",), ("proposals",), ("queue", "items"))
+    visible_items = items[:5]
+    _store_visible_queue_scope(session_id, visible_items)
     lines = ["KB Queue"]
     if count is not None:
         lines.append(f"{count} pending")
     if not items:
         lines.append("No proposal previews returned.")
-    for idx, item in enumerate(items[:5], start=1):
+    for idx, item in enumerate(visible_items, start=1):
         if isinstance(item, dict):
             lines.append("")
             lines.append(f"{idx}. {_item_title(item)}")
@@ -2987,6 +3256,7 @@ def _render_queue(data: Any, *, ctx: Any | None = None, target: str | None = Non
         lines.append("Review one: /kb queue review 1")
         lines.append("Then preview a listed action, for example: /kb queue reject 1")
         lines.append("Batch: /kb queue reject 1,2")
+        lines.append("Visible batch: reply Reject all to preview only the items shown here")
         lines.append("Confirm after preview: /kb queue reject 1 confirm")
     return {"title": "KB Queue", "text": "\n".join(lines), "actions": []}
 
@@ -3101,6 +3371,7 @@ def _card_for_command(
     session_store: Any = None,
 ) -> dict[str, Any]:
     target = _mcp_target()
+    queue_session_id = _conversation_state_id(session_store, source)
     cockpit_args = {
         "attention_limit": 5,
         "include_publication": True,
@@ -3172,8 +3443,16 @@ def _card_for_command(
         if mode == "review" and indices:
             return _render_queue_item(data, index=indices[0], ctx=ctx, target=target)
         if mode == "decision" and indices and decision:
-            return _render_queue_text_decision(ctx, target, data, indices=indices, decision=decision, confirm=confirm)
-        return _render_queue(data, ctx=ctx, target=target)
+            return _render_queue_text_decision(
+                ctx,
+                target,
+                data,
+                indices=indices,
+                decision=decision,
+                confirm=confirm,
+                session_id=queue_session_id,
+            )
+        return _render_queue(data, ctx=ctx, target=target, session_id=queue_session_id)
     if command == "kbpublish":
         return _render_publish_command(ctx, target, args)
     if command == "kbmeeting":
@@ -3328,7 +3607,8 @@ def build_pre_gateway_dispatch_hook(ctx: Any) -> Callable[..., dict[str, str] | 
         text = getattr(event, "text", "")
         command = _command_from_text(text)
         bare_decision = _bare_queue_reply_decision(text)
-        if command is None and not bare_decision:
+        visible_all_decision = _visible_scope_all_decision(text)
+        if command is None and not bare_decision and not visible_all_decision:
             return None
         if not _authorized_for_gateway(gateway, source):
             return None
@@ -3336,7 +3616,15 @@ def build_pre_gateway_dispatch_hook(ctx: Any) -> Callable[..., dict[str, str] | 
         if adapter is None:
             logger.debug("kb_journeys: no Telegram adapter available")
             return None
-        if bare_decision:
+        if visible_all_decision:
+            session_id = _conversation_state_id(session_store, source)
+            card = _render_visible_scope_all_decision(
+                ctx,
+                _mcp_target(),
+                session_id=session_id,
+                decision=visible_all_decision,
+            )
+        elif bare_decision:
             session_id = _session_id_for_queue_reply_state(session_store, source)
             state = _get_iterative_queue_reply_state(session_id)
             if not state:

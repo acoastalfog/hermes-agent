@@ -19,6 +19,21 @@ class FakeContext:
         return json.dumps(result)
 
 
+class SequencedFakeContext:
+    def __init__(self, results):
+        self.results = {key: list(value) for key, value in results.items()}
+        self.calls = []
+
+    def dispatch_tool(self, tool_name, args):
+        self.calls.append((tool_name, args))
+        values = self.results.get(tool_name)
+        if values:
+            result = values.pop(0)
+        else:
+            result = {"error": f"missing {tool_name}"}
+        return json.dumps(result)
+
+
 class FakeAdapter:
     def __init__(self):
         self.sent = []
@@ -989,6 +1004,188 @@ def test_kbqueue_decision_can_be_previewed_and_confirmed_by_text_command(monkeyp
     assert ctx.calls[-1][1]["user_confirmation"]["confirmed"] is True
 
 
+def test_kbqueue_text_confirm_uses_preview_scope_when_queue_shifts(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = SequencedFakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": [
+                {
+                    "result": {
+                        "total": 2,
+                        "items": [
+                            {
+                                "item_id": "accounts/eli-lilly",
+                                "title": "Eli Lilly",
+                                "kind": "proposal_entity",
+                                "preview": "Project Nova situation proposal.",
+                                "raw": {"proposal_ids": ["act_eli"]},
+                            }
+                        ],
+                    }
+                },
+                {
+                    "result": {
+                        "total": 1,
+                        "items": [
+                            {
+                                "item_id": "accounts/atomic-ai",
+                                "title": "Atomic AI",
+                                "kind": "proposal_entity",
+                                "preview": "Different proposal now occupies index 1.",
+                                "raw": {"proposal_ids": ["act_atomic"]},
+                            }
+                        ],
+                    }
+                },
+            ],
+            "mcp_kb_engine_prod_queue_decision_preview": [
+                {"result": {"status": "preview", "ok": True, "plan": {"summary": "Reject Eli."}}},
+                {"result": {"status": "preview", "ok": True, "plan": {"summary": "Reject Eli after re-preview."}}},
+            ],
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": [
+                {"result": {"status": "applied", "ok": True, "publication": {"status": "manual"}}}
+            ],
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+    store = FakeSessionStore("session-shift")
+
+    preview = hook(event=_event("/kb queue reject 1"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+    applied = hook(event=_event("/kb queue reject 1 confirm"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+
+    assert preview == {"action": "skip", "reason": "kb_journeys"}
+    assert applied == {"action": "skip", "reason": "kb_journeys"}
+    assert "Eli Lilly" in adapter.sent[1]["text"]
+    assert "Atomic AI" not in adapter.sent[1]["text"]
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-2][1]["proposal_ids"] == ["act_eli"]
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[-1][1]["proposal_ids"] == ["act_eli"]
+    assert ctx.calls[-1][1]["user_confirmation"]["proposal_ids"] == ["act_eli"]
+
+
+def test_kbqueue_reject_all_previews_visible_window_only(monkeypatch, tmp_path):
+    from plugins import kb_journeys
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "total": 11,
+                    "items": [
+                        {"item_id": "a", "title": "Atomic AI", "raw": {"proposal_ids": ["act_atomic"]}},
+                        {"item_id": "n", "title": "Nous Research", "raw": {"proposal_ids": ["act_nous"]}},
+                        {"item_id": "p", "title": "Palantir", "raw": {"proposal_ids": ["act_palantir"]}},
+                        {"item_id": "s", "title": "Stellantis", "raw": {"proposal_ids": ["act_stellantis"]}},
+                        {"item_id": "t", "title": "TSMC", "raw": {"proposal_ids": ["act_tsmc"]}},
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_queue_decision_preview": {
+                "result": {"status": "preview", "ok": True, "plan": {"summary": "Reject 5 shown proposals."}}
+            },
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": {
+                "result": {"status": "applied", "ok": True}
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+    store = FakeSessionStore("session-visible-all")
+
+    listed = hook(event=_event("/kb queue"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+    preview = hook(event=_event("Reject all"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+
+    assert listed == {"action": "skip", "reason": "kb_journeys"}
+    assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
+        session_id="session-visible-all",
+        message="Reject all",
+    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
+    assert preview == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-1][1]["proposal_ids"] == [
+        "act_atomic",
+        "act_nous",
+        "act_palantir",
+        "act_stellantis",
+        "act_tsmc",
+    ]
+    assert "Scope: visible Telegram queue window only" in adapter.sent[-1]["text"]
+    assert "To apply: /kb queue reject 1,2,3,4,5 confirm" in adapter.sent[-1]["text"]
+    assert "mcp_kb_engine_prod_queue_batch_decide_confirmed" not in [call[0] for call in ctx.calls]
+
+
+def test_kbqueue_reject_all_without_visible_scope_does_not_fall_through(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext({})
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(
+        event=_event("Reject all"),
+        gateway=_authorized_gateway(adapter),
+        session_store=FakeSessionStore("session-empty"),
+    )
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls == []
+    assert "Run /kb queue first" in adapter.sent[0]["text"]
+
+
+def test_kbqueue_visible_scope_all_phrases_are_narrow_decisions():
+    from plugins import kb_journeys
+
+    assert kb_journeys._visible_scope_all_decision("Reject the five proposals you showed me") == "reject"
+    assert kb_journeys._visible_scope_all_decision("Approve everything visible") == "approve"
+    assert kb_journeys._visible_scope_all_decision("Review proposals") == ""
+
+
+def test_kbqueue_visible_scope_without_timestamp_expires(monkeypatch, tmp_path):
+    from plugins import kb_journeys
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    path = kb_journeys._queue_scope_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "session-stale": {
+                    "visible": {
+                        "kind": "visible_queue_window",
+                        "selection": [
+                            {
+                                "index": 1,
+                                "title": "Old Proposal",
+                                "proposal_ids": ["act_old"],
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert kb_journeys._get_visible_queue_scope("session-stale") == []
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "visible" not in stored["session-stale"]
+
+
 def test_kbqueue_bare_reply_uses_visible_iterative_item_state(monkeypatch, tmp_path):
     from plugins import kb_journeys
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
@@ -1240,13 +1437,16 @@ def test_kbqueue_decision_supports_batch_text_commands_and_legacy_alias(monkeypa
     adapter = FakeKbActionsAdapter()
     hook = build_pre_gateway_dispatch_hook(ctx)
 
+    preview = hook(event=_event("/kbqueue reject 1, 2"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
     result = hook(event=_event("/kbqueue reject 1, 2 confirm"), gateway=_authorized_gateway(adapter), session_store=None)
     _drain_scheduled_tasks()
 
+    assert preview == {"action": "skip", "reason": "kb_journeys"}
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    assert "Queue Reject Applied" in adapter.sent[0]["text"]
-    assert "1. Keio University" in adapter.sent[0]["text"]
-    assert "2. Mistral" in adapter.sent[0]["text"]
+    assert "Queue Reject Applied" in adapter.sent[1]["text"]
+    assert "1. Keio University" in adapter.sent[1]["text"]
+    assert "2. Mistral" in adapter.sent[1]["text"]
     assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
     assert ctx.calls[-2][1]["proposal_ids"] == ["act_1", "act_2", "act_3"]
     assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
