@@ -266,4 +266,4 @@ async def test_kb_callback_expired_button_sends_visible_refresh_hint():
     query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)
     sent = adapter._bot.send_message.call_args[1]
     assert "expired" in sent["text"].lower()
-    assert "/kbqueue" in sent["text"]
+    assert "/kb review" in sent["text"]

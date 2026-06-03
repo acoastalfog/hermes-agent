@@ -3069,12 +3069,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 pending = kb_callbacks.get_pending(callback_id)
                 if not pending:
-                    await query.answer(text="Action expired. Use /kbqueue to refresh.")
+                    await query.answer(text="Action expired. Use /kb review to refresh.")
                     try:
                         await query.edit_message_reply_markup(reply_markup=None)
                     except Exception:
                         pass
-                    await _send_visible_kb_callback_text("KB action expired\nUse /kbqueue to refresh.")
+                    await _send_visible_kb_callback_text("KB action expired\nUse /kb review to refresh.")
                     return
 
                 await query.answer(text="Opening KB action...")

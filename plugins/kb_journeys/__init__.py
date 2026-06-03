@@ -36,6 +36,22 @@ SUPPORTED_RESULT_PACKET_TYPES = {
     "request.receipt",
     "report_admission_receipt",
 }
+DESCRIPTOR_READONLY_TARGET_KINDS = {
+    "closeout",
+    "component",
+    "dashboard_surface",
+    "event",
+    "object_graph",
+    "proposal_queue",
+    "publication",
+    "receipt",
+    "report",
+    "run",
+    "situation",
+    "sync",
+    "todo",
+}
+DESCRIPTOR_WRITE_TARGET_KINDS = DESCRIPTOR_READONLY_TARGET_KINDS.difference({"dashboard_surface", "run"})
 
 
 def _sanitize_component(value: str) -> str:
@@ -1013,7 +1029,7 @@ def _dashboard_descriptor_actions(ctx: Any, target: str, sections: list[Any]) ->
                 mutation = _short(descriptor.get("mutation"), "read_only")
                 target_kind = str(descriptor.get("target_kind") or "").strip()
                 if mutation == "read_only":
-                    if target_kind not in {"component", "event", "object_graph", "publication", "report", "situation"}:
+                    if target_kind not in DESCRIPTOR_READONLY_TARGET_KINDS:
                         continue
                     if not (descriptor.get("preview_tool") or descriptor.get("method")):
                         continue
@@ -1072,30 +1088,125 @@ def _descriptor_advisory_guidance(descriptor: dict[str, Any]) -> dict[str, Any]:
     return guidance
 
 
-def _render_descriptor_guidance(descriptor: dict[str, Any], *, title: str = "KB Guidance") -> dict[str, Any]:
+def _guidance_status(guidance: dict[str, Any]) -> str:
+    status = _short(guidance.get("status") or guidance.get("state"), "").strip().lower()
+    if status:
+        return status
+    if guidance.get("stale") is True or _get_path(guidance, "staleness", "stale") is True:
+        return "stale"
+    return "available"
+
+
+def _guidance_field(guidance: dict[str, Any], *keys: str, limit: int = 520) -> str:
+    for key in keys:
+        value = guidance.get(key)
+        if isinstance(value, dict):
+            value = value.get("summary") or value.get("label") or value.get("text") or value.get("message")
+        if isinstance(value, list):
+            value = "; ".join(_short(item, "") for item in value[:4])
+        text = _redact_guidance_text(value, limit=limit)
+        if text:
+            return text
+    return ""
+
+
+def _guidance_facet_text(guidance: dict[str, Any], facet: str) -> tuple[str, str]:
+    facet_key = str(facet or "summary").strip().lower()
+    if facet_key == "why":
+        return "Why", _guidance_field(guidance, "why", "why_now", "why_this_matters", "summary")
+    if facet_key == "recommend":
+        return "Recommendation", _guidance_field(guidance, "recommendation", "recommend", "recommended_action", "next_best_action")
+    if facet_key == "evidence":
+        return "Evidence", _guidance_field(guidance, "evidence", "evidence_summary", "evidence_refs", "supporting_evidence")
+    if facet_key == "missing":
+        return "Missing Context", _guidance_field(guidance, "missing_context", "evidence_gaps", "gaps", "missing")
+    return "Guidance", _guidance_field(guidance, "summary")
+
+
+def _descriptor_guidance_actions(descriptor: dict[str, Any], *, title: str) -> list[Any]:
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return []
+    actions: list[Any] = []
+    for facet, label in (
+        ("why", "Why"),
+        ("recommend", "Recommend"),
+        ("evidence", "Evidence"),
+        ("missing", "Missing Context"),
+    ):
+        actions.append(
+            KbAction(
+                label=label,
+                action_id=f"guidance.{facet}",
+                handler=lambda callback_ctx, d=dict(descriptor), f=facet: _render_descriptor_guidance(
+                    d,
+                    title=title,
+                    facet=f,
+                    include_facet_actions=False,
+                ),
+                metadata={
+                    "target_kind": descriptor.get("target_kind"),
+                    "target_ref": descriptor.get("target_ref"),
+                    "advisory_only": True,
+                    "guidance_facet": facet,
+                },
+            )
+        )
+    return actions
+
+
+def _render_descriptor_guidance(
+    descriptor: dict[str, Any],
+    *,
+    title: str = "KB Guidance",
+    facet: str = "summary",
+    include_facet_actions: bool = True,
+) -> dict[str, Any]:
     guidance = _descriptor_advisory_guidance(descriptor)
     if not guidance:
         return {"title": title, "text": f"{title}\nNo advisory guidance was attached to this action.", "actions": []}
+    status = _guidance_status(guidance)
+    if status in {"unavailable", "blocked", "error", "failed"}:
+        reason = _guidance_field(guidance, "unavailable_reason", "reason", "message", limit=240)
+        lines = [
+            title,
+            _short(descriptor.get("label") or descriptor.get("action_id") or "KB action", "KB action"),
+            "",
+            f"Guidance unavailable: {reason or status}.",
+            "Advisory output never confirms, applies, commits, or publishes.",
+        ]
+        return {"title": title, "text": "\n".join(lines), "actions": []}
+    stale = status in {"stale", "expired"}
+    facet_title, facet_text = _guidance_facet_text(guidance, facet)
     lines = [
         title,
         _short(descriptor.get("label") or descriptor.get("action_id") or "KB action", "KB action"),
         "",
-        _clip(guidance.get("summary") or "Guidance is advisory only and cannot mutate durable KB state.", 520),
+        facet_text or "Guidance is advisory only and cannot mutate durable KB state.",
         "",
         f"Prompt: {_short(guidance.get('llm_prompt'), 'kb.review_guidance')}",
         f"Mode: {_short(guidance.get('mode'), 'advisory_only')}",
         f"Authority: {_short(guidance.get('authority'), 'no_mutation_authority')}",
         "Mutates KB: no",
     ]
+    if facet != "summary":
+        lines.insert(2, facet_title)
+    if stale:
+        lines.append("Status: stale; refresh the KB review card before relying on this guidance.")
     sequence = guidance.get("recommended_sequence") if isinstance(guidance.get("recommended_sequence"), list) else []
-    if sequence:
+    if sequence and facet == "summary":
         lines.append("")
         lines.append("Suggested sequence:")
         for step in sequence[:4]:
-            lines.append(f"- {_clip(step, 180)}")
+            lines.append(f"- {_redact_guidance_text(step, limit=180)}")
     lines.append("")
     lines.append("Advisory output never confirms, applies, commits, or publishes. Use the preview/confirm button path for writes.")
-    return {"title": title, "text": "\n".join(lines), "actions": []}
+    return {
+        "title": title,
+        "text": "\n".join(lines),
+        "actions": _descriptor_guidance_actions(descriptor, title=title) if include_facet_actions and not stale else [],
+    }
 
 
 def _render_readonly_descriptor_action(
@@ -1148,13 +1259,7 @@ def _generic_descriptor_action(ctx: Any, target: str, descriptor: dict[str, Any]
     confirm_tool = _descriptor_tool_name(target, descriptor.get("confirm_tool"))
     if not preview_tool or not confirm_tool:
         return None
-    if str(descriptor.get("target_kind") or "").strip() not in {
-        "event",
-        "object_graph",
-        "publication",
-        "report",
-        "situation",
-    }:
+    if str(descriptor.get("target_kind") or "").strip() not in DESCRIPTOR_WRITE_TARGET_KINDS:
         return None
     label = _short(descriptor.get("label") or descriptor.get("action_id") or "Action", "Action")
     action_id = _short(descriptor.get("action_id") or label, label)
@@ -1193,6 +1298,7 @@ def _generic_preview_text(label: str, payload: Any) -> str:
         if changed_paths:
             lines.append(f"Changed paths: {len(changed_paths)}")
             lines.extend(_format_changed_paths(changed_paths, limit=5))
+        lines.extend(_queue_scope_lines(payload))
         summary = _short(payload.get("summary") or payload.get("message"), "")
         if summary:
             lines.append("Summary: " + _clip(summary, 260))
@@ -1219,19 +1325,23 @@ def _render_generic_descriptor_preview(
     text = _generic_preview_text(label, preview_payload)
     if not _preview_allows_confirmation(preview_payload):
         return {"title": label, "text": text, "actions": []}
+    preview_metadata = _queue_preview_metadata(preview_payload)
     confirm_action = KbAction(
         label=f"Confirm {label}",
         action_id=f"{action_id}.confirm",
-        handler=lambda confirm_ctx, d=dict(descriptor): _render_generic_descriptor_confirm(
+        handler=lambda confirm_ctx, d=dict(descriptor), metadata=dict(preview_metadata): _render_generic_descriptor_confirm(
             ctx,
             target,
             descriptor=d,
             callback_ctx=confirm_ctx,
+            preview_metadata=metadata,
         ),
         metadata={
             "target_kind": descriptor.get("target_kind"),
             "target_ref": descriptor.get("target_ref"),
             "preview_required": True,
+            "preview_lease": bool(preview_metadata.get("preview_lease")),
+            "review_session_id": _review_session_id(preview_metadata),
         },
     )
     return {
@@ -1247,14 +1357,19 @@ def _render_generic_descriptor_confirm(
     *,
     descriptor: dict[str, Any],
     callback_ctx: Any,
+    preview_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     label = _short(descriptor.get("label") or descriptor.get("action_id") or "KB Action", "KB Action")
     preview_tool = _descriptor_tool_name(target, descriptor.get("preview_tool") or descriptor.get("method"))
     confirm_tool = _descriptor_tool_name(target, descriptor.get("confirm_tool"))
-    preview_payload = _result_payload(ctx.dispatch_tool(preview_tool, _descriptor_params(descriptor)))
-    if not _preview_allows_confirmation(preview_payload):
-        return {"title": label, "text": _generic_preview_text(label, preview_payload), "actions": []}
+    effective_metadata = dict(preview_metadata or {})
+    if not effective_metadata.get("preview_lease"):
+        preview_payload = _result_payload(ctx.dispatch_tool(preview_tool, _descriptor_params(descriptor)))
+        if not _preview_allows_confirmation(preview_payload):
+            return {"title": label, "text": _generic_preview_text(label, preview_payload), "actions": []}
+        effective_metadata.update(_queue_preview_metadata(preview_payload))
     confirm_args = _descriptor_params(descriptor)
+    _apply_queue_preview_metadata(confirm_args, effective_metadata)
     confirm_args["user_confirmation"] = {
         "confirmed": True,
         "surface": "telegram",
@@ -1264,9 +1379,10 @@ def _render_generic_descriptor_confirm(
         "actor_id": _short(getattr(callback_ctx, "actor_id", ""), ""),
         "actor_name": _short(getattr(callback_ctx, "actor_name", ""), ""),
     }
+    _apply_queue_confirmation_preview_metadata(confirm_args["user_confirmation"], effective_metadata)
     confirm_args.setdefault("actor", _queue_callback_actor(callback_ctx))
     confirm_args.setdefault("source", "Hermes Telegram Action Card")
-    confirm_args.setdefault("session_id", f"telegram-kb-card-{int(time.time())}")
+    confirm_args.setdefault("session_id", _review_session_id(effective_metadata) or f"telegram-kb-card-{int(time.time())}")
     confirmed_payload = _result_payload(ctx.dispatch_tool(confirm_tool, confirm_args))
     packet_card = _render_supported_result_packet(confirmed_payload, ctx=ctx, target=target)
     if packet_card is not None:
@@ -1589,6 +1705,17 @@ def _safe_scope_label(value: Any) -> str:
     return text
 
 
+def _redact_guidance_text(value: Any, *, limit: int = 520) -> str:
+    text = _clip(value, limit)
+    if not text:
+        return ""
+    text = re.sub(r"(?i)\b(?:token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+", "[redacted]", text)
+    text = re.sub(r"(?i)\b(?:sk|ghp|gho|github_pat|xox[abprs])_[A-Za-z0-9_\-]{12,}", "[redacted]", text)
+    text = re.sub(r"(?i)(?:/Users|/home|/private|/tmp|~)/\S+", "[redacted-path]", text)
+    text = re.sub(r"(?i)\b\S*(?:\.env|id_rsa|id_ed25519|credentials|token|cache)\S*\b", "[redacted]", text)
+    return text
+
+
 def _queue_count_value(*values: Any) -> int | None:
     for value in values:
         try:
@@ -1623,7 +1750,9 @@ def _apply_queue_preview_metadata(args: dict[str, Any], metadata: dict[str, Any]
         args.setdefault("cursor_id", cursor_id)
     decision_scope = _queue_decision_scope(metadata)
     if decision_scope:
-        args.setdefault("decision_scope", decision_scope)
+        # The confirmed write must follow the backend preview lease, even when a
+        # descriptor supplied a conservative default scope.
+        args["decision_scope"] = decision_scope
 
 
 def _apply_queue_confirmation_preview_metadata(user_confirmation: dict[str, Any], metadata: dict[str, Any]) -> None:
@@ -1947,6 +2076,9 @@ def _queue_descriptor_call_args(
     args = dict(params)
     args["proposal_ids"] = proposal_ids
     args["decision"] = decision
+    args.setdefault("decision_scope", "explicit_ids")
+    args.setdefault("displayed_count", len(proposal_ids))
+    args.setdefault("candidate_count", len(proposal_ids))
     args["actor"] = actor
     args["source"] = source
     args["note"] = note
@@ -2218,7 +2350,37 @@ def _queue_scope_stale(record: Any) -> bool:
     return bool(time.time() - recorded_at > QUEUE_SCOPE_STATE_TTL_SECONDS)
 
 
-def _store_visible_queue_scope(session_id: str, items: list[Any]) -> None:
+def _queue_total(data: Any) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    return _queue_count_value(
+        data.get("total"),
+        data.get("count"),
+        _get_path(data, "counts", "proposals"),
+        _get_path(data, "queue", "count"),
+    )
+
+
+def _queue_offset(data: Any) -> int:
+    if not isinstance(data, dict):
+        return 0
+    return _queue_count_value(data.get("offset"), _get_path(data, "page", "offset")) or 0
+
+
+def _queue_next_offset(data: Any) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    return _queue_count_value(data.get("next_offset"), _get_path(data, "page", "next_offset"))
+
+
+def _store_visible_queue_scope(
+    session_id: str,
+    items: list[Any],
+    *,
+    total: int | None = None,
+    offset: int = 0,
+    next_offset: int | None = None,
+) -> None:
     if not session_id:
         return
     selection = [(idx, item) for idx, item in enumerate(items, start=1) if isinstance(item, dict)]
@@ -2229,18 +2391,31 @@ def _store_visible_queue_scope(session_id: str, items: list[Any]) -> None:
         "kind": "visible_queue_window",
         "recorded_at": time.time(),
         "selection": _queue_selection_snapshot(selection),
+        "offset": int(offset),
+        "displayed_count": len(selection),
     }
+    if total is not None:
+        state["visible"]["candidate_count"] = int(total)
+    if next_offset is not None:
+        state["visible"]["next_offset"] = int(next_offset)
     _save_queue_scope_states(states)
 
 
-def _get_visible_queue_scope(session_id: str) -> list[tuple[int, dict[str, Any]]]:
+def _get_visible_queue_scope_record(session_id: str) -> dict[str, Any]:
     states, state = _queue_scope_state(session_id)
     if state is None:
-        return []
+        return {}
     visible = state.get("visible")
     if _queue_scope_stale(visible):
         state.pop("visible", None)
         _save_queue_scope_states(states)
+        return {}
+    return dict(visible) if isinstance(visible, dict) else {}
+
+
+def _get_visible_queue_scope(session_id: str) -> list[tuple[int, dict[str, Any]]]:
+    visible = _get_visible_queue_scope_record(session_id)
+    if not visible:
         return []
     return _queue_selection_from_snapshot(visible.get("selection"))
 
@@ -2351,6 +2526,12 @@ def _preview_allows_confirmation(payload: Any) -> bool:
         "error",
         "failed",
         "operator_blocked",
+        "preview_lease_expired",
+        "preview_lease_missing",
+        "preview_lease_mismatch",
+        "preview_lease_stale",
+        "stale_cursor",
+        "stale_preview_lease",
         "validation_failed",
     }:
         return False
@@ -2836,7 +3017,8 @@ def _render_visible_scope_all_decision(
     session_id: str,
     decision: str,
 ) -> dict[str, Any]:
-    selection = _get_visible_queue_scope(session_id)
+    visible_record = _get_visible_queue_scope_record(session_id)
+    selection = _queue_selection_from_snapshot(visible_record.get("selection")) if visible_record else []
     if not selection:
         return {
             "title": "KB Queue",
@@ -2853,12 +3035,17 @@ def _render_visible_scope_all_decision(
     actor = "telegram:operator"
     source = "Hermes Telegram visible queue"
     preview_tool = _mcp_tool_name(target, "queue.decision_preview")
+    candidate_count = _queue_count_value(visible_record.get("candidate_count"), len(selection))
+    displayed_count = _queue_count_value(visible_record.get("displayed_count"), len(selection))
     preview_payload = _result_payload(
         ctx.dispatch_tool(
             preview_tool,
             {
                 "proposal_ids": proposal_ids,
                 "decision": decision,
+                "decision_scope": "all_viewed",
+                "candidate_count": candidate_count,
+                "displayed_count": displayed_count,
                 "actor": actor,
                 "source": source,
                 "note": f"Previewed from Telegram visible queue scope for {len(selection)} shown item(s)",
@@ -2880,14 +3067,26 @@ def _render_visible_scope_all_decision(
     return {"title": "KB Queue", "text": text, "actions": []}
 
 
-def _queue_summary_payload(ctx: Any, target: str, *, limit: int = 5) -> tuple[Any | None, list[str]]:
+def _queue_summary_payload(
+    ctx: Any,
+    target: str,
+    *,
+    limit: int = 5,
+    offset: int = 0,
+    selected_id: str = "",
+) -> tuple[Any | None, list[str]]:
+    args = {"scope": "proposals", "limit": limit}
+    if offset:
+        args["offset"] = int(offset)
+    if selected_id:
+        args["selected_id"] = selected_id
     _, data, errors = _dispatch_first(
         ctx,
         target,
         [
-            ("queue.summary", {"scope": "proposals", "limit": limit}),
+            ("queue.summary", dict(args)),
+            ("workbench.queue", dict(args)),
             ("queue.preview", {"limit": limit}),
-            ("workbench.queue", {"scope": "proposals", "limit": limit}),
         ],
     )
     return data, errors
@@ -3502,6 +3701,25 @@ def _render_queue_skip(
     target: str,
     session_id: str = "",
 ) -> dict[str, Any]:
+    current_item = _queue_item_at(data, index)
+    offset = _queue_offset(data)
+    server_data = None
+    if ctx is not None and target:
+        server_data, _errors = _queue_summary_payload(ctx, target, limit=5, offset=offset + index)
+    if server_data is not None:
+        server_item = _queue_item_at(server_data, 1)
+        current_ids = _proposal_ids_for_item(current_item) if isinstance(current_item, dict) else []
+        server_ids = _proposal_ids_for_item(server_item) if isinstance(server_item, dict) else []
+        if server_item is not None and (not current_ids or server_ids != current_ids):
+            _store_iterative_state_from_item(session_id, server_item)
+            card = _render_queue_item(server_data, index=1, ctx=ctx, target=target)
+            card["text"] = (
+                f"Skipped item {offset + index} locally. No KB state changed.\n"
+                "Advanced to the next kb-engine queue window.\n\n"
+                + card["text"]
+            )
+            return card
+
     next_index = index + 1
     next_item = _queue_item_at(data, next_index)
     if next_item is None:
@@ -3635,6 +3853,9 @@ def _render_queue_text_decision(
                 {
                     "proposal_ids": proposal_ids,
                     "decision": decision,
+                    "decision_scope": "explicit_ids",
+                    "candidate_count": len(proposal_ids),
+                    "displayed_count": len(proposal_ids),
                     "actor": actor,
                     "source": source,
                     "note": f"Previewed from Telegram /kb queue text command for {selected_titles}",
@@ -4055,7 +4276,10 @@ def _render_queue(
         count = data.get("total") or data.get("count") or _count_from(data, "queue", "proposals")
     items = _items(data, ("items",), ("proposals",), ("queue", "items"))
     visible_items = items[:5]
-    _store_visible_queue_scope(session_id, visible_items)
+    total = _queue_total(data)
+    offset = _queue_offset(data)
+    next_offset = _queue_next_offset(data)
+    _store_visible_queue_scope(session_id, visible_items, total=total, offset=offset, next_offset=next_offset)
     if visible_items and isinstance(visible_items[0], dict):
         _store_iterative_state_from_item(session_id, visible_items[0])
     elif session_id:
@@ -4083,7 +4307,11 @@ def _render_queue(
             lines.append(f"{idx}. {_short(item)}")
     if items:
         lines.append("")
-        lines.append("Reviewing item 1 now. Decision buttons open previews; nothing applies until Confirm.")
+        if offset:
+            lines.append(f"Reviewing item {offset + 1} now. Decision buttons open previews; nothing applies until Confirm.")
+        else:
+            lines.append("Reviewing item 1 now. Decision buttons open previews; nothing applies until Confirm.")
+        lines.append("Review session: kb-engine preview leases back every confirmed write.")
         lines.append("Reply with a listed decision for item 1, or reply Reject all for the visible window.")
         lines.append("Text fallback: /kb queue reject 1")
         lines.append("Batch: /kb queue reject 1,2")

@@ -699,6 +699,189 @@ def test_dashboard_report_descriptor_renders_preview_confirm_receipts(monkeypatc
     assert ctx.calls[-1][1]["actor"] == "telegram:user-1"
 
 
+def test_dashboard_proposal_queue_descriptor_uses_generic_preview_confirm_with_lease(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    descriptor = {
+        "packet_type": "dashboard_action_descriptor",
+        "schema_version": 2,
+        "action_id": "review.entity_reject",
+        "label": "Reject visible proposal",
+        "method": "queue.batch_decide_confirmed",
+        "mutation": "workspace_write",
+        "target_kind": "proposal_queue",
+        "target_ref": "accounts/acme",
+        "preview_tool": "queue.decision_preview",
+        "confirm_tool": "queue.batch_decide_confirmed",
+        "params": {"proposal_ids": ["act_acme"], "decision": "reject"},
+        "dashboard_owned_write": False,
+        "requires_canonical_tool": True,
+        "confirmation_copy": "Confirm Reject after reviewing the proposal preview.",
+    }
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_dashboard_live": {
+                "result": {
+                    "surface": "dashboard.live",
+                    "summary": {"publication_status": "dirty", "readiness_status": "ready"},
+                    "sections": [
+                        {
+                            "id": "workbench",
+                            "title": "Review Queue",
+                            "cards": [
+                                {
+                                    "id": "proposal:accounts/acme",
+                                    "title": "Acme proposal",
+                                    "action_descriptors": [descriptor],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_queue_decision_preview": {
+                "result": {
+                    "status": "preview",
+                    "ok": True,
+                    "summary": "Reject Acme only after review.",
+                    "review_session": {
+                        "review_session_id": "review_session_acme",
+                        "decision_scope": "explicit_ids",
+                        "cursor": {"cursor_id": "cursor_acme", "displayed_count": 1, "candidate_count": 1},
+                    },
+                    "preview_lease": {
+                        "preview_lease_id": "lease_acme",
+                        "review_session_id": "review_session_acme",
+                        "cursor_id": "cursor_acme",
+                        "decision_scope": "explicit_ids",
+                    },
+                }
+            },
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": {
+                "result": {
+                    "packet_type": "request.receipt",
+                    "schema_version": 1,
+                    "route": "queue.batch_decide_confirmed",
+                    "status": "applied",
+                    "ok": True,
+                    "confirmed_count": 1,
+                    "affected_ids": ["act_acme"],
+                }
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb workbench"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Preview Reject visible proposal")
+    preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(preview_card):
+        preview_card = asyncio.run(preview_card)
+
+    assert "Scope: Selected" in preview_card["text"]
+    assert preview_card["actions"][0].metadata["preview_lease"] is True
+    assert preview_card["actions"][0].metadata["review_session_id"] == "review_session_acme"
+
+    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(confirm_card):
+        confirm_card = asyncio.run(confirm_card)
+
+    assert "KB Queue Receipt" in confirm_card["text"]
+    assert "Affected ids: act_acme" in confirm_card["text"]
+    assert [call[0] for call in ctx.calls] == [
+        "mcp_kb_engine_prod_dashboard_live",
+        "mcp_kb_engine_prod_queue_decision_preview",
+        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
+    ]
+    confirm_args = ctx.calls[-1][1]
+    assert confirm_args["session_id"] == "review_session_acme"
+    assert confirm_args["review_session_id"] == "review_session_acme"
+    assert confirm_args["cursor_id"] == "cursor_acme"
+    assert confirm_args["decision_scope"] == "explicit_ids"
+    assert confirm_args["user_confirmation"]["preview_lease"]["preview_lease_id"] == "lease_acme"
+
+
+def test_descriptor_guidance_facets_are_advisory_and_redacted():
+    from plugins import kb_journeys
+
+    descriptor = {
+        "action_id": "review.entity_reject",
+        "label": "Reject",
+        "target_kind": "proposal_queue",
+        "target_ref": "accounts/acme",
+        "advisory_guidance": {
+            "packet_type": "kb_advisory_guidance",
+            "schema_version": 1,
+            "mode": "advisory_only",
+            "authority": "no_mutation_authority",
+            "llm_prompt": "kb.review_guidance",
+            "mutates_state": False,
+            "summary": "Use care before deciding.",
+            "why": "The proposed update lacks a durable delta.",
+            "recommendation": "Reject unless the evidence improves.",
+            "evidence": [
+                "Source body is cached at /Users/acosta/private/source.txt",
+                "token=super-secret-value",
+            ],
+            "missing_context": "Need a concrete owner or date.",
+        },
+    }
+
+    card = kb_journeys._render_descriptor_guidance(descriptor, title="KB Queue LLM Guidance")
+    assert [action.label for action in card["actions"]] == ["Why", "Recommend", "Evidence", "Missing Context"]
+    assert "Advisory output never confirms" in card["text"]
+
+    evidence_card = card["actions"][2].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(evidence_card):
+        evidence_card = asyncio.run(evidence_card)
+
+    assert "Evidence" in evidence_card["text"]
+    assert "/Users/acosta" not in evidence_card["text"]
+    assert "super-secret-value" not in evidence_card["text"]
+    assert evidence_card["actions"] == []
+
+
+def test_descriptor_guidance_unavailable_and_stale_states_are_non_authoritative():
+    from plugins import kb_journeys
+
+    unavailable = {
+        "action_id": "review.entity_reject",
+        "label": "Reject",
+        "advisory_guidance": {
+            "packet_type": "kb_advisory_guidance",
+            "schema_version": 1,
+            "status": "unavailable",
+            "mutates_state": False,
+            "unavailable_reason": "No guidance route is attached.",
+        },
+    }
+    unavailable_card = kb_journeys._render_descriptor_guidance(unavailable, title="KB Queue LLM Guidance")
+    assert "Guidance unavailable" in unavailable_card["text"]
+    assert "No guidance route" in unavailable_card["text"]
+    assert unavailable_card["actions"] == []
+
+    stale = {
+        "action_id": "review.entity_reject",
+        "label": "Reject",
+        "advisory_guidance": {
+            "packet_type": "kb_advisory_guidance",
+            "schema_version": 1,
+            "status": "stale",
+            "mutates_state": False,
+            "summary": "This recommendation came from an old queue packet.",
+        },
+    }
+    stale_card = kb_journeys._render_descriptor_guidance(stale, title="KB Queue LLM Guidance")
+    assert "Status: stale" in stale_card["text"]
+    assert "Advisory output never confirms" in stale_card["text"]
+    assert stale_card["actions"] == []
+
+
 def test_plain_non_kb_commands_are_left_for_system_handlers(monkeypatch):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
@@ -926,6 +1109,74 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
 
     assert "Skipped item 1 locally. No KB state changed." in skip_card["text"]
     assert "Queue Item 2" in skip_card["text"]
+    assert "Keio University" in skip_card["text"]
+
+
+def test_kb_queue_skip_uses_server_window_when_available(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = SequencedFakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": [
+                {
+                    "result": {
+                        "total": 3,
+                        "offset": 0,
+                        "next_offset": 1,
+                        "items": [
+                            {
+                                "item_id": "accounts/mistral",
+                                "title": "Mistral",
+                                "kind": "proposal_entity",
+                                "summary": "Admission: Mistral has licensing coordination.",
+                                "raw": {"proposal_ids": ["act_2"]},
+                            },
+                            {
+                                "item_id": "accounts/keio-university",
+                                "title": "Keio University",
+                                "kind": "proposal_entity",
+                                "summary": "Admission: Keio has a healthcare AI PoC.",
+                                "raw": {"proposal_ids": ["act_3"]},
+                            },
+                        ],
+                    }
+                },
+                {
+                    "result": {
+                        "total": 3,
+                        "offset": 1,
+                        "next_offset": 2,
+                        "items": [
+                            {
+                                "item_id": "accounts/keio-university",
+                                "title": "Keio University",
+                                "kind": "proposal_entity",
+                                "summary": "Admission: Keio has a healthcare AI PoC.",
+                                "raw": {"proposal_ids": ["act_3"]},
+                            }
+                        ],
+                    }
+                },
+            ]
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+    store = FakeSessionStore("session-server-skip")
+
+    result = hook(event=_event("/kb queue"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    skip_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Skip")
+    skip_card = skip_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(skip_card):
+        skip_card = asyncio.run(skip_card)
+
+    assert ctx.calls[-1] == ("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5, "offset": 1})
+    assert "Advanced to the next kb-engine queue window" in skip_card["text"]
     assert "Keio University" in skip_card["text"]
 
 
@@ -1520,6 +1771,9 @@ def test_kbqueue_reject_all_previews_visible_window_only(monkeypatch, tmp_path):
         "act_stellantis",
         "act_tsmc",
     ]
+    assert ctx.calls[-1][1]["decision_scope"] == "all_viewed"
+    assert ctx.calls[-1][1]["candidate_count"] == 11
+    assert ctx.calls[-1][1]["displayed_count"] == 5
     assert "Scope: visible Telegram queue window only" in adapter.sent[-1]["text"]
     assert "To apply: /kb queue reject 1,2,3,4,5 confirm" in adapter.sent[-1]["text"]
     assert "mcp_kb_engine_prod_queue_batch_decide_confirmed" not in [call[0] for call in ctx.calls]
