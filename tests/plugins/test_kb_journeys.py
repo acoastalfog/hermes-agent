@@ -1079,10 +1079,69 @@ def test_kbqueue_decision_can_be_previewed_and_confirmed_by_text_command(monkeyp
                 "result": {
                     "status": "applied",
                     "ok": True,
+                    "receipt": {
+                        "packet_type": "request.receipt",
+                        "state": "applied",
+                        "route": "queue.batch_decide_confirmed",
+                        "saved": True,
+                        "ok": True,
+                        "receipt_id": "qrcpt-1",
+                        "affected_ids": ["act_2"],
+                        "reviewed_count": 1,
+                        "confirmed_count": 1,
+                        "transaction_id": "control:abc",
+                        "restore_available": True,
+                        "restore_hint": {
+                            "preview_tool": "queue.restore_preview",
+                            "confirm_tool": "queue.restore_confirmed",
+                            "transaction_id": "control:abc",
+                            "receipt_id": "qrcpt-1",
+                            "proposal_ids": ["act_2"],
+                        },
+                        "safe_message": "Applied queue decision to 1 proposal(s).",
+                    },
                     "publication": {"status": "manual"},
                     "git": {
                         "before": {"branch": "main", "changed_count": 0},
                         "after": {"branch": "main", "changed_count": 3, "changes": ["a", "b", "c"]},
+                    },
+                }
+            },
+            "mcp_kb_engine_prod_queue_restore_preview": {
+                "result": {
+                    "status": "noop",
+                    "ok": True,
+                    "restorable_ids": ["act_2"],
+                    "incompatible_ids": [],
+                    "already_restored_ids": [],
+                    "review_session": {
+                        "review_session_id": "restore-session-1",
+                        "cursor": {"cursor_id": "restore-cursor-1", "displayed_count": 1, "candidate_count": 1},
+                    },
+                    "preview_lease": {
+                        "preview_lease_id": "restore-lease-1",
+                        "review_session_id": "restore-session-1",
+                        "cursor_id": "restore-cursor-1",
+                        "decision_scope": "explicit_ids",
+                        "proposal_ids": ["act_2"],
+                    },
+                }
+            },
+            "mcp_kb_engine_prod_queue_restore_confirmed": {
+                "result": {
+                    "status": "applied",
+                    "ok": True,
+                    "receipt": {
+                        "packet_type": "request.receipt",
+                        "state": "applied",
+                        "route": "queue.restore_confirmed",
+                        "saved": True,
+                        "ok": True,
+                        "receipt_id": "qrcpt-restore-1",
+                        "affected_ids": ["act_2"],
+                        "restored_ids": ["act_2"],
+                        "transaction_id": "control:restore",
+                        "safe_message": "Restored 1 proposal(s) to the review queue.",
                     },
                 }
             },
@@ -1105,16 +1164,34 @@ def test_kbqueue_decision_can_be_previewed_and_confirmed_by_text_command(monkeyp
 
     assert applied == {"action": "skip", "reason": "kb_journeys"}
     applied_text = adapter.sent[1]["text"]
-    assert "Queue Reject Applied" in applied_text
-    assert "Mistral" in applied_text
-    assert "Target: accounts/mistral" in applied_text
-    assert "Proposal ids: act_2" in applied_text
-    assert "Git: 3 changed path(s) on main" in applied_text
+    assert "KB Queue Receipt" in applied_text
+    assert "Applied queue decision to 1 proposal(s)." in applied_text
+    assert "Affected ids: act_2" in applied_text
+    assert "Counts: 1 reviewed · 1 confirmed" in applied_text
+    assert adapter.sent[1]["actions"][0].label == "Preview Restore"
+    restore_preview = adapter.sent[1]["actions"][0].handler(SimpleNamespace(actor_id="777", actor_name="Ada"))
+    assert "Queue restore preview" in restore_preview["text"]
+    assert "Restorable ids: act_2" in restore_preview["text"]
+    assert restore_preview["actions"][0].label == "Confirm Restore"
+    restore_result = restore_preview["actions"][0].handler(SimpleNamespace(actor_id="777", actor_name="Ada"))
+    assert "Restored 1 proposal(s) to the review queue." in restore_result["text"]
+    assert "Restored ids: act_2" in restore_result["text"]
     assert "{'before':" not in applied_text
-    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
-    assert ctx.calls[-2][1]["proposal_ids"] == ["act_2"]
-    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
-    assert ctx.calls[-1][1]["user_confirmation"]["confirmed"] is True
+    assert ctx.calls[-4][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-4][1]["proposal_ids"] == ["act_2"]
+    assert ctx.calls[-3][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[-3][1]["user_confirmation"]["confirmed"] is True
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_restore_preview"
+    assert ctx.calls[-2][1] == {
+        "transaction_id": "control:abc",
+        "receipt_id": "qrcpt-1",
+        "proposal_ids": ["act_2"],
+    }
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_restore_confirmed"
+    assert ctx.calls[-1][1]["review_session_id"] == "restore-session-1"
+    assert ctx.calls[-1][1]["cursor_id"] == "restore-cursor-1"
+    assert ctx.calls[-1][1]["user_confirmation"]["preview_lease"]["preview_lease_id"] == "restore-lease-1"
+    assert "preview_lease" not in ctx.calls[-1][1]
 
 
 def test_kbqueue_text_confirm_uses_preview_scope_when_queue_shifts(monkeypatch, tmp_path):

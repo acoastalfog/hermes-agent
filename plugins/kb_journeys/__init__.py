@@ -33,6 +33,7 @@ MEETING_HANDOFF_STATE_TTL_SECONDS = 15 * 60
 SUPPORTED_RESULT_PACKET_TYPES = {
     "durable_graph_validation",
     "publication_observation",
+    "request.receipt",
     "report_admission_receipt",
 }
 
@@ -343,7 +344,244 @@ def _render_publication_observation_packet(packet: dict[str, Any]) -> dict[str, 
     return {"title": "Publication Observation", "text": "\n".join(lines), "actions": []}
 
 
-def _render_supported_result_packet(payload: Any) -> dict[str, Any] | None:
+def _id_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _id_line(label: str, values: list[str], *, limit: int = 8) -> str:
+    shown = ", ".join(values[:limit])
+    if len(values) > limit:
+        shown += f", +{len(values) - limit} more"
+    return f"{label}: {shown}"
+
+
+def _restore_hint(receipt: dict[str, Any]) -> dict[str, Any]:
+    hint = receipt.get("restore_hint")
+    return hint if isinstance(hint, dict) else {}
+
+
+def _restore_args_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    hint = _restore_hint(receipt)
+    args = hint.get("params") if isinstance(hint.get("params"), dict) else {}
+    args = dict(args)
+    for key in ("transaction_id", "receipt_id"):
+        value = _short(hint.get(key) or receipt.get(key), "")
+        if value:
+            args.setdefault(key, value)
+    proposal_ids = _id_list(hint.get("proposal_ids")) or _id_list(receipt.get("affected_ids"))
+    if proposal_ids:
+        args.setdefault("proposal_ids", proposal_ids)
+    return {key: value for key, value in args.items() if value not in (None, "", [])}
+
+
+def _restore_tools(target: str, receipt: dict[str, Any]) -> tuple[str, str]:
+    hint = _restore_hint(receipt)
+    preview_tool = _descriptor_tool_name(
+        target,
+        hint.get("preview_tool") or hint.get("restore_preview_tool") or "queue.restore_preview",
+    )
+    confirm_tool = _descriptor_tool_name(
+        target,
+        hint.get("confirm_tool") or hint.get("restore_confirm_tool") or "queue.restore_confirmed",
+    )
+    return preview_tool, confirm_tool
+
+
+def _restore_preview_text(payload: Any) -> str:
+    if isinstance(payload, dict) and payload.get("error"):
+        return f"Queue restore preview failed\n{payload['error']}"
+    if not isinstance(payload, dict):
+        return f"Queue restore preview\n{_short(payload, 'No structured response returned.')}"
+    lines = [
+        "Queue restore preview",
+        f"Status: {_short(payload.get('status') or payload.get('state'))} · ok: {_short(payload.get('ok'))}",
+    ]
+    restorable = _id_list(payload.get("restorable_ids"))
+    incompatible = _id_list(payload.get("incompatible_ids"))
+    already_restored = _id_list(payload.get("already_restored_ids"))
+    if restorable:
+        lines.append(_id_line("Restorable ids", restorable))
+    if incompatible:
+        lines.append(_id_line("Blocked ids", incompatible))
+    if already_restored:
+        lines.append(_id_line("Already restored", already_restored))
+    lines.extend(_queue_scope_lines(payload))
+    return "\n".join(lines)
+
+
+def _restore_action_from_receipt(ctx: Any | None, target: str, receipt: dict[str, Any]) -> Any | None:
+    if ctx is None or receipt.get("restore_available") is not True or not _restore_hint(receipt):
+        return None
+    preview_tool, confirm_tool = _restore_tools(target, receipt)
+    args = _restore_args_from_receipt(receipt)
+    if not preview_tool or not confirm_tool or not args:
+        return None
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return None
+    return KbAction(
+        label="Preview Restore",
+        action_id="queue.restore.preview",
+        handler=lambda callback_ctx, r=dict(receipt): _render_restore_preview(
+            ctx,
+            target,
+            receipt=r,
+            callback_ctx=callback_ctx,
+        ),
+        metadata={
+            "target_kind": "proposal_queue",
+            "preview_tool": preview_tool,
+            "confirm_tool": confirm_tool,
+            "preview_required": True,
+            "restore_available": True,
+        },
+    )
+
+
+def _render_restore_preview(
+    ctx: Any,
+    target: str,
+    *,
+    receipt: dict[str, Any],
+    callback_ctx: Any,
+) -> dict[str, Any]:
+    del callback_ctx
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return {"title": "KB Queue Restore", "text": "KB Queue Restore\nAction buttons are unavailable. Use /kb queue to refresh.", "actions": []}
+    preview_tool, _confirm_tool = _restore_tools(target, receipt)
+    preview_payload = _result_payload(ctx.dispatch_tool(preview_tool, _restore_args_from_receipt(receipt)))
+    text = _restore_preview_text(preview_payload)
+    if not _preview_allows_confirmation(preview_payload):
+        return {"title": "KB Queue Restore", "text": text, "actions": []}
+    preview_metadata = _queue_preview_metadata(preview_payload)
+    confirm_action = KbAction(
+        label="Confirm Restore",
+        action_id="queue.restore.confirm",
+        handler=lambda confirm_ctx, r=dict(receipt), metadata=dict(preview_metadata): _render_restore_confirm(
+            ctx,
+            target,
+            receipt=r,
+            callback_ctx=confirm_ctx,
+            preview_metadata=metadata,
+        ),
+        metadata={
+            "target_kind": "proposal_queue",
+            "preview_required": True,
+            "preview_lease": bool(preview_metadata.get("preview_lease")),
+            "review_session_id": _review_session_id(preview_metadata),
+        },
+    )
+    return {
+        "title": "KB Queue Restore",
+        "text": text + "\n\nConfirm restore only if these ids match the receipt you intended to undo.",
+        "actions": [confirm_action],
+    }
+
+
+def _render_restore_confirm(
+    ctx: Any,
+    target: str,
+    *,
+    receipt: dict[str, Any],
+    callback_ctx: Any,
+    preview_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preview_tool, confirm_tool = _restore_tools(target, receipt)
+    effective_metadata = dict(preview_metadata or {})
+    if not effective_metadata.get("preview_lease"):
+        preview_payload = _result_payload(ctx.dispatch_tool(preview_tool, _restore_args_from_receipt(receipt)))
+        if not _preview_allows_confirmation(preview_payload):
+            return {"title": "KB Queue Restore", "text": _restore_preview_text(preview_payload), "actions": []}
+        effective_metadata.update(_queue_preview_metadata(preview_payload))
+    args = _restore_args_from_receipt(receipt)
+    review_session_id = _review_session_id(effective_metadata)
+    cursor_id = _queue_cursor_id(effective_metadata)
+    if review_session_id:
+        args.setdefault("review_session_id", review_session_id)
+    if cursor_id:
+        args.setdefault("cursor_id", cursor_id)
+    args.setdefault("actor", _queue_callback_actor(callback_ctx))
+    args.setdefault("source", "Hermes Telegram Action Card")
+    args.setdefault("session_id", review_session_id or f"telegram-kb-restore-{int(time.time())}")
+    args["user_confirmation"] = {
+        "confirmed": True,
+        "surface": "telegram",
+        "action": "queue.restore",
+        "preview_required": True,
+        "confirmation_text": "Confirm queue restore from Telegram receipt action card.",
+        "actor_id": _short(getattr(callback_ctx, "actor_id", ""), ""),
+        "actor_name": _short(getattr(callback_ctx, "actor_name", ""), ""),
+    }
+    _apply_queue_confirmation_preview_metadata(args["user_confirmation"], effective_metadata)
+    payload = _result_payload(ctx.dispatch_tool(confirm_tool, args))
+    packet_card = _render_supported_result_packet(payload, ctx=ctx, target=target)
+    if packet_card is not None:
+        return packet_card
+    return {"title": "KB Queue Restore", "text": _restore_preview_text(payload).replace("preview", "result", 1), "actions": []}
+
+
+def _render_request_receipt_packet(
+    packet: dict[str, Any],
+    *,
+    ctx: Any | None = None,
+    target: str = "",
+) -> dict[str, Any]:
+    route = _short(packet.get("route"), "")
+    title = "KB Queue Receipt" if route.startswith("queue.") else "KB Request Receipt"
+    lines = [
+        title,
+        f"State: {_short(packet.get('state') or packet.get('status'))}",
+    ]
+    if packet.get("saved") is not None:
+        lines.append("Saved: " + ("yes" if packet.get("saved") else "no"))
+    if route:
+        lines.append(f"Route: {route}")
+    if packet.get("receipt_id"):
+        lines.append(f"Receipt: {_short(packet.get('receipt_id'))}")
+    if packet.get("transaction_id"):
+        lines.append(f"Transaction: {_short(packet.get('transaction_id'))}")
+    count_bits: list[str] = []
+    if packet.get("reviewed_count") is not None:
+        count_bits.append(f"{_short(packet.get('reviewed_count'), '0')} reviewed")
+    if packet.get("confirmed_count") is not None:
+        count_bits.append(f"{_short(packet.get('confirmed_count'), '0')} confirmed")
+    if count_bits:
+        lines.append("Counts: " + " · ".join(count_bits))
+    for label, key in (
+        ("Affected ids", "affected_ids"),
+        ("Restored ids", "restored_ids"),
+        ("Skipped ids", "skipped_ids"),
+        ("Changed refs", "changed_refs"),
+    ):
+        ids = _id_list(packet.get(key))
+        if ids:
+            lines.append(_id_line(label, ids))
+    message = _short(packet.get("safe_message") or packet.get("message"), "")
+    if message:
+        lines.append(_clip(message, 260))
+    next_step = _short(packet.get("next_step"), "")
+    if next_step:
+        lines.append("Next: " + _clip(next_step, 220))
+    if packet.get("restore_available") is True:
+        lines.append("Restore: preview available")
+    action = _restore_action_from_receipt(ctx, target, packet)
+    return {"title": title, "text": "\n".join(lines), "actions": [action] if action else []}
+
+
+def _render_supported_result_packet(
+    payload: Any,
+    *,
+    ctx: Any | None = None,
+    target: str = "",
+) -> dict[str, Any] | None:
     packet = _first_result_packet(payload)
     if not packet:
         return None
@@ -354,6 +592,8 @@ def _render_supported_result_packet(payload: Any) -> dict[str, Any] | None:
         return _render_graph_validation_packet(packet)
     if packet_type == "publication_observation":
         return _render_publication_observation_packet(packet)
+    if packet_type == "request.receipt":
+        return _render_request_receipt_packet(packet, ctx=ctx, target=target)
     return None
 
 
@@ -790,7 +1030,7 @@ def _render_readonly_descriptor_action(
     label = _short(descriptor.get("label") or descriptor.get("action_id") or "KB Context", "KB Context")
     if isinstance(payload, dict) and payload.get("error"):
         return {"title": label, "text": f"{label}\n{payload['error']}", "actions": []}
-    packet_card = _render_supported_result_packet(payload)
+    packet_card = _render_supported_result_packet(payload, ctx=ctx, target=target)
     if packet_card is not None:
         return packet_card
     if not isinstance(payload, dict):
@@ -946,7 +1186,7 @@ def _render_generic_descriptor_confirm(
     confirm_args.setdefault("source", "Hermes Telegram Action Card")
     confirm_args.setdefault("session_id", f"telegram-kb-card-{int(time.time())}")
     confirmed_payload = _result_payload(ctx.dispatch_tool(confirm_tool, confirm_args))
-    packet_card = _render_supported_result_packet(confirmed_payload)
+    packet_card = _render_supported_result_packet(confirmed_payload, ctx=ctx, target=target)
     if packet_card is not None:
         return packet_card
     return {"title": label, "text": _generic_preview_text(label.replace("Preview", "Applied"), confirmed_payload), "actions": []}
@@ -1754,6 +1994,9 @@ def _render_queue_descriptor_confirm(
     }
     _apply_queue_confirmation_preview_metadata(confirmed_args["user_confirmation"], effective_metadata)
     confirmed_payload = _result_payload(ctx.dispatch_tool(confirmed_tool, confirmed_args))
+    packet_card = _render_supported_result_packet(confirmed_payload, ctx=ctx, target=target)
+    if packet_card is not None:
+        return packet_card
     return {
         "title": "KB Queue",
         "text": _confirmed_text(decision, confirmed_payload, selection=selection, proposal_ids=proposal_ids),
@@ -3160,6 +3403,11 @@ def _render_queue_text_decision(
     _apply_queue_preview_metadata(confirmed_args, preview_metadata)
     _apply_queue_confirmation_preview_metadata(confirmed_args["user_confirmation"], preview_metadata)
     confirmed_payload = _result_payload(ctx.dispatch_tool(confirmed_tool, confirmed_args))
+    packet_card = _render_supported_result_packet(confirmed_payload, ctx=ctx, target=target)
+    if packet_card is not None:
+        if missing:
+            packet_card["text"] += "\nSkipped missing queue item(s): " + ", ".join(str(index) for index in missing)
+        return packet_card
     text = _confirmed_text(decision, confirmed_payload, selection=selection, proposal_ids=proposal_ids)
     if missing:
         text += "\nSkipped missing queue item(s): " + ", ".join(str(index) for index in missing)
