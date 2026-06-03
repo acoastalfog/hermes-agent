@@ -844,7 +844,11 @@ def _render_dashboard(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
     )
     sections = data.get("sections") if isinstance(data.get("sections"), list) else []
     queue_count = _proposal_count_from_summary(summary)
+    if queue_count is None:
+        queue_count = _count_from(data, "proposals", "proposal_queue")
     todo_count = _todo_count_from_summary(summary)
+    if todo_count is None:
+        todo_count = _count_from(data, "todo", "todos")
     active_runs = summary.get("active_run_count")
     lines = [
         "KB Cockpit",
@@ -901,6 +905,91 @@ def _render_dashboard(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
     return {"title": "KB Dashboard", "text": "\n".join(lines), "actions": _dashboard_descriptor_actions(ctx, target, sections)}
 
 
+_WORKBENCH_SECTION_IDS = {"closeout", "now", "reports", "situations", "workbench"}
+
+
+def _dashboard_card_descriptors(card: dict[str, Any]) -> list[dict[str, Any]]:
+    descriptors = card.get("action_descriptors") if isinstance(card.get("action_descriptors"), list) else []
+    safe: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            continue
+        if descriptor.get("dashboard_owned_write") is True:
+            continue
+        if descriptor.get("packet_type") != "dashboard_action_descriptor" or descriptor.get("schema_version") != 2:
+            continue
+        safe.append(descriptor)
+    return safe
+
+
+def _render_workbench(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"title": "KB Workbench", "text": f"KB Workbench\n{_short(data, 'No workbench details returned.')}", "actions": []}
+
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    readiness = _short(summary.get("readiness_status") or _readiness_status(data))
+    publication = _short(summary.get("publication_status") or _publication_status(data))
+    sections = data.get("sections") if isinstance(data.get("sections"), list) else []
+    queue_count = _proposal_count_from_summary(summary)
+    todo_count = _todo_count_from_summary(summary)
+    lines = [
+        "KB Workbench",
+        f"Runtime: {readiness}",
+        f"Publication: {publication}",
+    ]
+    counts: list[str] = []
+    if queue_count is not None:
+        counts.append(f"Proposals {queue_count}")
+    if todo_count is not None:
+        counts.append(f"TODOs {todo_count}")
+    if counts:
+        lines.append(" · ".join(counts))
+    lines.extend(_receipt_lines(data))
+
+    decision_cards: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("id") or "").strip().lower()
+        if section_id not in _WORKBENCH_SECTION_IDS:
+            continue
+        section_title = _dashboard_section_title(section, summary)
+        cards = section.get("cards") if isinstance(section.get("cards"), list) else []
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            descriptors = _dashboard_card_descriptors(card)
+            if descriptors:
+                decision_cards.append((section_title, card, descriptors))
+
+    lines.append("")
+    lines.append("Decision Cards")
+    if not decision_cards:
+        lines.append("No active kb-engine Decision Cards returned.")
+    for index, (section_title, card, descriptors) in enumerate(decision_cards[:5], start=1):
+        title = _display_text(card.get("title") or "KB action")
+        detail = _display_text(card.get("detail"))
+        labels = [_short(d.get("label") or d.get("action_id") or "Action", "Action") for d in descriptors[:3]]
+        lines.append(f"{index}. {title}")
+        if section_title:
+            lines.append(f"   Surface: {section_title}")
+        if detail:
+            lines.append(f"   Summary: {_clip(detail, 180)}")
+        if labels:
+            lines.append(f"   Actions: {', '.join(labels)}")
+    if len(decision_cards) > 5:
+        lines.append(f"... {len(decision_cards) - 5} more Decision Card(s)")
+
+    lines.extend(
+        [
+            "",
+            "Buttons open or preview canonical kb-engine actions; writes still require confirmation.",
+            "Fallback: /kb queue · /kb publish · /kb status",
+        ]
+    )
+    return {"title": "KB Workbench", "text": "\n".join(lines), "actions": _dashboard_descriptor_actions(ctx, target, sections)}
+
+
 def _dashboard_descriptor_actions(ctx: Any, target: str, sections: list[Any]) -> list[Any]:
     try:
         from tools.kb_callback_registry import KbAction
@@ -911,20 +1000,13 @@ def _dashboard_descriptor_actions(ctx: Any, target: str, sections: list[Any]) ->
     for section in sections:
         if not isinstance(section, dict):
             continue
-        if str(section.get("id") or "").strip().lower() not in {"closeout", "now", "reports", "situations", "workbench"}:
+        if str(section.get("id") or "").strip().lower() not in _WORKBENCH_SECTION_IDS:
             continue
         cards = section.get("cards") if isinstance(section.get("cards"), list) else []
         for card in cards:
             if not isinstance(card, dict):
                 continue
-            descriptors = card.get("action_descriptors") if isinstance(card.get("action_descriptors"), list) else []
-            for descriptor in descriptors:
-                if not isinstance(descriptor, dict):
-                    continue
-                if descriptor.get("dashboard_owned_write") is True:
-                    continue
-                if descriptor.get("packet_type") != "dashboard_action_descriptor" or descriptor.get("schema_version") != 2:
-                    continue
+            for descriptor in _dashboard_card_descriptors(card):
                 descriptor_copy = dict(descriptor)
                 label = _short(descriptor.get("label") or descriptor.get("action_id") or "Open", "Open")
                 action_id = _short(descriptor.get("action_id") or label, label)
@@ -961,11 +1043,11 @@ def _dashboard_descriptor_actions(ctx: Any, target: str, sections: list[Any]) ->
                 if guidance:
                     actions.append(
                         KbAction(
-                            label="Guidance",
+                            label="Ask LLM",
                             action_id=f"{action_id}.guidance",
                             handler=lambda callback_ctx, d=descriptor_copy: _render_descriptor_guidance(
                                 d,
-                                title="KB Situation Guidance",
+                                title="KB LLM Guidance",
                             ),
                             metadata={
                                 "target_kind": descriptor.get("target_kind"),
@@ -1798,11 +1880,11 @@ def _queue_descriptor_actions(
         descriptor_copy = dict(guidance_descriptor)
         actions.append(
             KbAction(
-                label="Guidance",
+                label="Ask LLM",
                 action_id="queue.advisory_guidance",
                 handler=lambda callback_ctx, d=descriptor_copy: _render_descriptor_guidance(
                     d,
-                    title="KB Queue Guidance",
+                    title="KB Queue LLM Guidance",
                 ),
                 metadata={
                     "target_kind": "proposal_queue",
@@ -2860,14 +2942,60 @@ def _publication_git_line(git_state: Any) -> str:
     return " · ".join(bits)
 
 
-def _closeout_action_descriptors(ctx: Any, target: str) -> list[dict[str, Any]]:
-    payload = _result_payload(ctx.dispatch_tool(_mcp_tool_name(target, "closeout.packet"), {"limit": 5}))
+def _closeout_packet(ctx: Any, target: str) -> Any:
+    return _result_payload(ctx.dispatch_tool(_mcp_tool_name(target, "closeout.packet"), {"limit": 5}))
+
+
+def _closeout_action_descriptors_from_payload(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     actions = payload.get("action_descriptors")
     if not isinstance(actions, list):
         return []
     return [action for action in actions if isinstance(action, dict)]
+
+
+def _closeout_action_descriptors(ctx: Any, target: str) -> list[dict[str, Any]]:
+    return _closeout_action_descriptors_from_payload(_closeout_packet(ctx, target))
+
+
+def _closeout_publication_lines(payload: Any) -> list[str]:
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    publication = payload.get("publication") if isinstance(payload.get("publication"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    lines: list[str] = []
+    status = _short(
+        publication.get("status")
+        or publication.get("state")
+        or publication.get("publication_status")
+        or summary.get("publication_status"),
+        "",
+    )
+    if status:
+        lines.append(f"Publication posture: {status}")
+    manual_expected = bool(
+        publication.get("manual_publication_expected")
+        or publication.get("manual_publication")
+        or summary.get("manual_publication_expected")
+        or payload.get("manual_publication_expected")
+    )
+    if manual_expected:
+        lines.append("Manual publication expected.")
+    changed_count = publication.get("changed_count")
+    if changed_count is None:
+        changed_count = summary.get("changed_count")
+    if changed_count is None:
+        changed_count = payload.get("changed_count")
+    if changed_count is None:
+        changed_paths = _changed_paths(publication) or _changed_paths(payload)
+        changed_count = len(changed_paths) if changed_paths else None
+    if changed_count is not None:
+        lines.append(f"Closeout changed paths: {_short(changed_count, '0')}")
+    reason = _short(publication.get("reason") or summary.get("publication_reason"), "")
+    if reason:
+        lines.append("Posture reason: " + _clip(reason, 220))
+    return lines
 
 
 def _publication_descriptor(descriptors: list[dict[str, Any]], method: str) -> dict[str, Any] | None:
@@ -2887,6 +3015,72 @@ def _publication_descriptor_args(descriptor: dict[str, Any] | None, *, message: 
     if message:
         args["message"] = message
     return args
+
+
+def _render_publication_preflight_descriptor(
+    ctx: Any,
+    target: str,
+    *,
+    descriptor: dict[str, Any],
+    callback_ctx: Any,
+) -> dict[str, Any]:
+    del callback_ctx
+    tool = _descriptor_tool_name(target, descriptor.get("preview_tool") or descriptor.get("method") or "publication.preflight")
+    payload = _result_payload(ctx.dispatch_tool(tool, _descriptor_params(descriptor)))
+    if isinstance(payload, dict) and payload.get("error"):
+        return {"title": "KB Publish", "text": f"KB Publication Preflight Failed\n{payload['error']}", "actions": []}
+    packet_card = _render_supported_result_packet(payload)
+    if packet_card is not None:
+        return packet_card
+    if not isinstance(payload, dict):
+        return {
+            "title": "KB Publish",
+            "text": "KB Publication Preflight\n" + _short(payload, "No structured response returned."),
+            "actions": [],
+        }
+    lines = [
+        "KB Publication Preflight",
+        f"Status: {_short(payload.get('status') or payload.get('state'))}",
+    ]
+    changed_paths = _changed_paths(payload)
+    if changed_paths:
+        lines.append(f"Changed paths: {len(changed_paths)}")
+        lines.extend(_format_changed_paths(changed_paths, limit=5))
+    lines.extend(_receipt_lines(payload, include_request=True))
+    warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
+    if warnings:
+        lines.extend(_warning_lines(warnings))
+    summary = _short(payload.get("summary") or payload.get("message"), "")
+    if summary:
+        lines.append("Summary: " + _clip(summary, 260))
+    return {"title": "KB Publish", "text": "\n".join(lines), "actions": []}
+
+
+def _publication_preflight_action(ctx: Any, target: str, descriptor: dict[str, Any] | None) -> list[Any]:
+    if not descriptor:
+        return []
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return []
+    return [
+        KbAction(
+            label="Run Preflight",
+            action_id="publication.preflight.open",
+            handler=lambda callback_ctx, d=dict(descriptor): _render_publication_preflight_descriptor(
+                ctx,
+                target,
+                descriptor=d,
+                callback_ctx=callback_ctx,
+            ),
+            metadata={
+                "target_kind": "publication",
+                "target_ref": descriptor.get("target_ref") or "publication",
+                "preview_tool": descriptor.get("preview_tool") or descriptor.get("method") or "publication.preflight",
+                "mutation": "read_only",
+            },
+        )
+    ]
 
 
 def _render_publish_descriptor_confirm(
@@ -2996,6 +3190,7 @@ def _render_publish_preview(
     *,
     confirm_hint: str = "/kb publish confirm",
     actions: list[Any] | None = None,
+    closeout_packet: Any = None,
 ) -> dict[str, Any]:
     if isinstance(payload, dict) and payload.get("error"):
         return {"title": "KB Publish", "text": f"KB Publish Preview Failed\n{payload['error']}", "actions": []}
@@ -3003,29 +3198,37 @@ def _render_publish_preview(
         return {"title": "KB Publish", "text": "KB Publish Preview Failed\nPublication preview returned an unexpected response.", "actions": []}
     packet_card = _render_supported_result_packet(payload)
     if packet_card is not None:
+        closeout_lines = _closeout_publication_lines(closeout_packet)
+        if closeout_lines:
+            packet_card["text"] = packet_card["text"] + "\n" + "\n".join(closeout_lines)
         packet_card["actions"] = actions or []
         return packet_card
     changed_paths = _changed_paths(payload)
     status = _short(payload.get("status"))
     message = _short(payload.get("message"), "Publish KB update")
     git_line = _publication_git_line(payload.get("git"))
+    closeout_lines = _closeout_publication_lines(closeout_packet)
     if not changed_paths:
         lines = [
             "KB Publish Preview",
+            "Decision Card: Publication",
             "Nothing to publish.",
             f"Status: {status}",
             f"Message: {message}",
         ]
+        lines.extend(closeout_lines)
         lines.extend(_receipt_lines(payload))
         if git_line:
             lines.append(f"Git: {git_line}")
-        return {"title": "KB Publish", "text": "\n".join(lines), "actions": []}
+        return {"title": "KB Publish", "text": "\n".join(lines), "actions": actions or []}
     lines = [
         "KB Publish Preview",
+        "Decision Card: Publication",
         f"Status: {status}",
         f"Message: {message}",
         f"Changed paths: {len(changed_paths)}",
     ]
+    lines.extend(closeout_lines)
     lines.extend(_receipt_lines(payload))
     if git_line:
         lines.append(f"Git: {git_line}")
@@ -3094,7 +3297,9 @@ def _render_publish_result(preview: Any, commit: Any, push: Any) -> dict[str, An
 
 def _render_publish_command(ctx: Any, target: str, args: str) -> dict[str, Any]:
     confirm, message = _publish_args(args)
-    descriptors = _closeout_action_descriptors(ctx, target)
+    closeout = _closeout_packet(ctx, target)
+    descriptors = _closeout_action_descriptors_from_payload(closeout)
+    preflight_descriptor = _publication_descriptor(descriptors, "publication.preflight")
     preview_descriptor = _publication_descriptor(descriptors, "publication.preview_commit")
     commit_descriptor = _publication_descriptor(descriptors, "publication.commit_confirmed")
     preview_tool = _descriptor_tool_name(
@@ -3111,9 +3316,9 @@ def _render_publish_command(ctx: Any, target: str, args: str) -> dict[str, Any]:
     session_id = f"telegram-kb-publish-{int(time.time())}"
     preview_payload = _result_payload(ctx.dispatch_tool(preview_tool, _publication_descriptor_args(preview_descriptor, message=message)))
     if not confirm:
-        preview_card = _render_publish_preview(
-            preview_payload,
-            actions=(
+        actions = _publication_preflight_action(ctx, target, preflight_descriptor)
+        if _changed_paths(preview_payload):
+            actions.extend(
                 _publish_confirm_action(
                     ctx,
                     target,
@@ -3121,18 +3326,20 @@ def _render_publish_command(ctx: Any, target: str, args: str) -> dict[str, Any]:
                     confirm_descriptor=commit_descriptor,
                     message=message,
                 )
-                if _changed_paths(preview_payload)
-                else []
-            ),
+            )
+        preview_card = _render_publish_preview(
+            preview_payload,
+            actions=actions,
+            closeout_packet=closeout,
         )
         return preview_card
     if not isinstance(preview_payload, dict) or preview_payload.get("error"):
-        return _render_publish_preview(preview_payload)
+        return _render_publish_preview(preview_payload, closeout_packet=closeout)
     changed_paths = _changed_paths(preview_payload)
     if not changed_paths:
         return {
             "title": "KB Publish",
-            "text": _render_publish_preview(preview_payload)["text"].replace("KB Publish Preview", "KB Publish"),
+            "text": _render_publish_preview(preview_payload, closeout_packet=closeout)["text"].replace("KB Publish Preview", "KB Publish"),
             "actions": [],
         }
     confirmation = {
@@ -3894,6 +4101,8 @@ def _kb_root_command(args: str) -> tuple[str, str]:
     rest = tail.strip()
     if key in {"dashboard", "home"}:
         return "kb", rest
+    if key in {"workbench", "wb", "cards", "decision-cards"}:
+        return "kbworkbench", rest
     if key in {"help", "commands"}:
         return "kbhelp", rest
     if key == "today":
@@ -3926,6 +4135,7 @@ def _kb_command_help() -> dict[str, Any]:
             [
                 "KB Commands",
                 "/kb - compact cockpit/status",
+                "/kb workbench - guided Decision Cards and next safe actions",
                 "/kb queue - proposal review list",
                 "/kb queue review 1 - inspect one queue item",
                 "/kb queue reject 1 - preview a decision",
@@ -4036,6 +4246,24 @@ def _card_for_command(
         return _render_error("KB Dashboard", target, errors) if data is None else _render_dashboard(data, ctx=ctx, target=target)
     if command == "kbhelp":
         return _kb_command_help()
+    if command == "kbworkbench":
+        _, data, errors = _dispatch_first(
+            ctx,
+            target,
+            [
+                (
+                    "dashboard.live",
+                    {
+                        "limit": 5,
+                        "include_feedback": True,
+                        "include_publication": True,
+                        "include_readiness": True,
+                    },
+                ),
+                ("attention.cockpit", cockpit_args),
+            ],
+        )
+        return _render_error("KB Workbench", target, errors) if data is None else _render_workbench(data, ctx=ctx, target=target)
     if command == "kbtoday":
         _, data, errors = _dispatch_first(ctx, target, [("attention.cockpit", cockpit_args)])
         return _render_error("KB Today", target, errors) if data is None else _render_today(data)

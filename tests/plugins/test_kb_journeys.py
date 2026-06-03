@@ -390,7 +390,7 @@ def test_dashboard_situation_descriptor_renders_readonly_action_button(monkeypat
     action = adapter.sent[0]["actions"][0]
     assert action.label == "Open situation"
     guidance_action = adapter.sent[0]["actions"][1]
-    assert guidance_action.label == "Guidance"
+    assert guidance_action.label == "Ask LLM"
 
     card = action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(card):
@@ -411,10 +411,97 @@ def test_dashboard_situation_descriptor_renders_readonly_action_button(monkeypat
     if asyncio.iscoroutine(guidance_card):
         guidance_card = asyncio.run(guidance_card)
 
-    assert "KB Situation Guidance" in guidance_card["text"]
+    assert "KB LLM Guidance" in guidance_card["text"]
     assert "kb.review_guidance" in guidance_card["text"]
     assert "no_mutation_authority" in guidance_card["text"]
     assert "Advisory output never confirms" in guidance_card["text"]
+
+
+def test_kb_workbench_renders_guided_decision_cards(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_dashboard_live": {
+                "result": {
+                    "surface": "dashboard.live",
+                    "summary": {
+                        "active_todo_count": 4,
+                        "proposal_queue": {"count": 3},
+                        "publication_status": "dirty",
+                        "readiness_status": "ready",
+                    },
+                    "sections": [
+                        {
+                            "id": "workbench",
+                            "title": "Review Queue",
+                            "cards": [
+                                {
+                                    "id": "proposal:accounts/acme",
+                                    "title": "Review Acme proposal",
+                                    "detail": "Decide whether the proposed Situation should be created.",
+                                    "action_descriptors": [
+                                        {
+                                            "packet_type": "dashboard_action_descriptor",
+                                            "schema_version": 2,
+                                            "action_id": "proposal.details",
+                                            "label": "Details",
+                                            "method": "object.context",
+                                            "mutation": "read_only",
+                                            "target_kind": "situation",
+                                            "target_ref": "accounts/acme",
+                                            "preview_tool": "object.context",
+                                            "params": {"object_path": "accounts/acme/state.md"},
+                                            "advisory_guidance": _advisory_guidance(
+                                                "Ask for advisory guidance before deciding on Acme."
+                                            ),
+                                            "dashboard_owned_write": False,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_object_context": {
+                "result": {
+                    "title": "Acme context",
+                    "summary": "Canonical evidence for the proposal.",
+                    "receipt": {"state": "answered", "durable_effect": "none"},
+                }
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("/kb workbench"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    text = adapter.sent[0]["text"]
+    assert "KB Workbench" in text
+    assert "Decision Cards" in text
+    assert "Review Acme proposal" in text
+    assert "Buttons open or preview canonical kb-engine actions" in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details", "Ask LLM"]
+
+    guidance_card = adapter.sent[0]["actions"][1].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(guidance_card):
+        guidance_card = asyncio.run(guidance_card)
+
+    assert "KB LLM Guidance" in guidance_card["text"]
+    assert "Ask for advisory guidance before deciding on Acme." in guidance_card["text"]
+    assert "Advisory output never confirms" in guidance_card["text"]
+
+    detail_card = adapter.sent[0]["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(detail_card):
+        detail_card = asyncio.run(detail_card)
+
+    assert "Acme context" in detail_card["text"]
+    assert ctx.calls[-1] == ("mcp_kb_engine_prod_object_context", {"object_path": "accounts/acme/state.md"})
 
 
 def test_dashboard_validation_descriptor_renders_graph_receipt(monkeypatch):
@@ -818,7 +905,7 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
     text = adapter.sent[0]["text"]
     assert "Reviewing item 1 now" in text
     assert "Decision buttons open previews" in text
-    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details", "Guidance", "Reject", "Skip"]
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details", "Ask LLM", "Reject", "Skip"]
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-guided",
         message="Reject",
@@ -1032,11 +1119,11 @@ def test_kbqueue_review_item_renders_descriptor_preview_and_confirm_buttons(monk
     assert result == {"action": "skip", "reason": "kb_journeys"}
     assert adapter.sent[0]["actions"]
     guidance_action = adapter.sent[0]["actions"][0]
-    assert guidance_action.label == "Guidance"
+    assert guidance_action.label == "Ask LLM"
     guidance_card = guidance_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(guidance_card):
         guidance_card = asyncio.run(guidance_card)
-    assert "KB Queue Guidance" in guidance_card["text"]
+    assert "KB Queue LLM Guidance" in guidance_card["text"]
     assert "Use advisory guidance to reason about Reject" in guidance_card["text"]
     assert "kb.review_guidance" in guidance_card["text"]
     assert "Advisory output never confirms" in guidance_card["text"]
@@ -1846,7 +1933,28 @@ def test_kb_publish_renders_descriptor_confirm_action_button(monkeypatch):
                 "result": {
                     "packet_type": "closeout.packet",
                     "contract_id": "kb.closeout.operation.v1",
+                    "publication": {
+                        "status": "dirty",
+                        "manual_publication_expected": True,
+                        "changed_count": 1,
+                        "reason": "KB workspace has unpublished review-session changes.",
+                    },
                     "action_descriptors": [
+                        {
+                            "packet_type": "dashboard_action_descriptor",
+                            "schema_version": 2,
+                            "action_id": "publication.preflight",
+                            "label": "Run publication preflight",
+                            "method": "publication.preflight",
+                            "mutation": "read_only",
+                            "target_kind": "publication",
+                            "target_ref": "publication",
+                            "preview_tool": "publication.preflight",
+                            "confirm_tool": "",
+                            "params": {},
+                            "dashboard_owned_write": False,
+                            "requires_canonical_tool": True,
+                        },
                         {
                             "packet_type": "dashboard_action_descriptor",
                             "schema_version": 2,
@@ -1890,6 +1998,17 @@ def test_kb_publish_renders_descriptor_confirm_action_button(monkeypatch):
                     "git": {"branch": "main", "head": "abc123", "upstream": "origin/main"},
                 }
             },
+            "mcp_kb_engine_prod_publication_preflight": {
+                "result": {
+                    "packet_type": "publication_observation",
+                    "schema_version": 1,
+                    "status": "dirty",
+                    "publication_state": "dirty",
+                    "changed_count": 1,
+                    "changed_paths": ["accounts/mistral/state.md"],
+                    "secret_values_exposed": False,
+                }
+            },
             "mcp_kb_engine_prod_publication_commit_confirmed": {
                 "result": {
                     "status": "committed",
@@ -1914,7 +2033,20 @@ def test_kb_publish_renders_descriptor_confirm_action_button(monkeypatch):
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     assert adapter.sent[0]["actions"]
-    confirm_action = adapter.sent[0]["actions"][0]
+    text = adapter.sent[0]["text"]
+    assert "Decision Card: Publication" in text
+    assert "Manual publication expected." in text
+    assert "KB workspace has unpublished review-session changes." in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Run Preflight", "Confirm Publish"]
+
+    preflight_card = adapter.sent[0]["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(preflight_card):
+        preflight_card = asyncio.run(preflight_card)
+
+    assert "Publication Observation" in preflight_card["text"]
+    assert "Changed paths: 1" in preflight_card["text"]
+
+    confirm_action = adapter.sent[0]["actions"][1]
     assert confirm_action.label == "Confirm Publish"
 
     confirm_card = confirm_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
@@ -1925,6 +2057,7 @@ def test_kb_publish_renders_descriptor_confirm_action_button(monkeypatch):
     assert [call[0] for call in ctx.calls] == [
         "mcp_kb_engine_prod_closeout_packet",
         "mcp_kb_engine_prod_publication_preview_commit",
+        "mcp_kb_engine_prod_publication_preflight",
         "mcp_kb_engine_prod_publication_preview_commit",
         "mcp_kb_engine_prod_publication_commit_confirmed",
         "mcp_kb_engine_prod_publication_push_confirmed",
