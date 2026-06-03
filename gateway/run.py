@@ -693,6 +693,37 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_kb_journeys_plugin_attr(name: str) -> Any:
+    """Resolve an attribute from the active kb_journeys plugin.
+
+    User-installed plugins shadow bundled plugins in Hermes' plugin manager.
+    Gateway runtime code must honor that active plugin instead of importing
+    ``plugins.kb_journeys`` directly, otherwise an external KB plugin can be
+    installed while the gateway still consults the bundled fallback.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        manager = get_plugin_manager()
+        loaded = getattr(manager, "_plugins", {}).get("kb_journeys")
+        module = getattr(loaded, "module", None) if loaded is not None else None
+        if getattr(loaded, "enabled", False) and module is not None:
+            attr = getattr(module, name, None)
+            if attr is not None:
+                return attr
+    except Exception:
+        logger.debug("Failed to resolve kb_journeys from plugin manager", exc_info=True)
+
+    try:
+        from plugins import kb_journeys as bundled_kb_journeys
+
+        return getattr(bundled_kb_journeys, name, None)
+    except Exception:
+        logger.debug("Failed to resolve bundled kb_journeys fallback", exc_info=True)
+        return None
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -14605,12 +14636,12 @@ class GatewayRunner:
         scoped_mcp_tool_allowlist = set()
         if platform_key == "telegram":
             try:
-                from plugins.kb_journeys import scoped_mcp_tool_allowlist_for_message
-
-                scoped_mcp_tool_allowlist = scoped_mcp_tool_allowlist_for_message(
-                    session_id=session_id,
-                    message=message,
-                )
+                resolver = _resolve_kb_journeys_plugin_attr("scoped_mcp_tool_allowlist_for_message")
+                if callable(resolver):
+                    scoped_mcp_tool_allowlist = resolver(
+                        session_id=session_id,
+                        message=message,
+                    )
             except Exception:
                 logger.debug("Failed to resolve scoped Telegram MCP tool allowlist", exc_info=True)
         enabled_toolsets = _apply_telegram_mcp_posture_filter(
