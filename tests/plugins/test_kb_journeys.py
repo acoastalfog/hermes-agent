@@ -1013,14 +1013,15 @@ def test_kb_root_queue_dashboard_starts_guided_first_item(monkeypatch):
     assert ctx.calls == [("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5})]
     assert adapter.sent
     text = adapter.sent[0]["text"]
-    assert "KB Queue" in text
-    assert "9 pending" in text
+    assert "KB Review" in text
+    assert "1 of 9 · Visible scope" in text
     assert "Admit Stanford DAS Lab" in text
-    assert "Target: accounts/stanford-das-lab" in text
-    assert "Review: /kb queue review 1" in text
-    assert "Reviewing item 1 now" in text
-    assert "Decision buttons open previews" in text
-    assert "Text fallback: /kb queue reject 1" in text
+    assert "Scope: accounts/stanford-das-lab · 2 proposals · 1 visible · 9 total" in text
+    assert "Rail: Details" in text
+    assert "Nothing applies until kb-engine returns a preview lease and you confirm." in text
+    assert "Review: /kb queue review 1" not in text
+    assert "Text fallback:" not in text
+    assert "Batch:" not in text
     assert [action.label for action in adapter.sent[0]["actions"]] == ["Details"]
     assert adapter.sent[0]["reply_to"] == "m1"
 
@@ -1047,6 +1048,19 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
                                 {
                                     "packet_type": "dashboard_action_descriptor",
                                     "schema_version": 2,
+                                    "action_id": "review.entity_approve",
+                                    "label": "Approve",
+                                    "target_kind": "proposal_queue",
+                                    "target_ref": "accounts/mistral",
+                                    "preview_tool": "queue.decision_preview",
+                                    "confirm_tool": "queue.batch_decide_confirmed",
+                                    "params": {"proposal_ids": ["act_2"], "decision": "approve"},
+                                    "dashboard_owned_write": False,
+                                    "requires_canonical_tool": True,
+                                },
+                                {
+                                    "packet_type": "dashboard_action_descriptor",
+                                    "schema_version": 2,
                                     "action_id": "review.entity_reject",
                                     "label": "Reject",
                                     "target_kind": "proposal_queue",
@@ -1059,7 +1073,20 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
                                     "advisory_guidance": _advisory_guidance(
                                         "Use advisory guidance to reason about Reject before previewing."
                                     ),
-                                }
+                                },
+                                {
+                                    "packet_type": "dashboard_action_descriptor",
+                                    "schema_version": 2,
+                                    "action_id": "review.entity_archive",
+                                    "label": "Archive",
+                                    "target_kind": "proposal_queue",
+                                    "target_ref": "accounts/mistral",
+                                    "preview_tool": "queue.decision_preview",
+                                    "confirm_tool": "queue.batch_decide_confirmed",
+                                    "params": {"proposal_ids": ["act_2"], "decision": "archive"},
+                                    "dashboard_owned_write": False,
+                                    "requires_canonical_tool": True,
+                                },
                             ],
                         },
                         {
@@ -1086,15 +1113,21 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     text = adapter.sent[0]["text"]
-    assert "Reviewing item 1 now" in text
-    assert "Decision buttons open previews" in text
-    assert [action.label for action in adapter.sent[0]["actions"]] == ["Details", "Ask LLM", "Reject", "Skip"]
+    assert "KB Review" in text
+    assert "Rail: Approve, Reject, Archive, Details, Ask LLM, Skip" in text
+    assert "Decision Card" not in text
+    assert "Preview Reject" not in text
+    assert "/kb queue review 1" not in text
+    assert "Text fallback:" not in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Approve", "Reject", "Archive", "Details", "Ask LLM", "Skip"]
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-guided",
         message="Reject",
     ) == {"mcp_kb_engine_prod_queue_decision_preview"}
 
-    preview_card = adapter.sent[0]["actions"][2].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    preview_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject").handler(
+        SimpleNamespace(actor_id="user-1", actor_name="tester")
+    )
     if asyncio.iscoroutine(preview_card):
         preview_card = asyncio.run(preview_card)
 
@@ -1103,7 +1136,9 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
     assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_decision_preview"
     assert ctx.calls[-1][1]["proposal_ids"] == ["act_2"]
 
-    skip_card = adapter.sent[0]["actions"][3].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    skip_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Skip").handler(
+        SimpleNamespace(actor_id="user-1", actor_name="tester")
+    )
     if asyncio.iscoroutine(skip_card):
         skip_card = asyncio.run(skip_card)
 
@@ -1208,9 +1243,10 @@ def test_kb_review_without_index_starts_guided_queue(monkeypatch):
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     assert ctx.calls == [("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5})]
-    assert "KB Queue" in adapter.sent[0]["text"]
-    assert "Reviewing item 1 now" in adapter.sent[0]["text"]
+    assert "KB Review" in adapter.sent[0]["text"]
+    assert "1 of 1 · Visible scope" in adapter.sent[0]["text"]
     assert "Use /kb queue to list proposals." not in adapter.sent[0]["text"]
+    assert "/kb queue review 1" not in adapter.sent[0]["text"]
 
 
 def test_kbqueue_review_item_can_be_opened_by_text_command(monkeypatch):
@@ -1248,7 +1284,7 @@ def test_kbqueue_review_item_can_be_opened_by_text_command(monkeypatch):
     assert "Queue Item 1" in text
     assert "Keio University" in text
     assert "Target: accounts/keio-university" in text
-    assert "Available actions:" in text
+    assert "Fallback text actions:" in text
     assert "/kb queue reject 1" in text
     assert adapter.sent[0]["actions"] == []
 
@@ -1305,7 +1341,7 @@ def test_kbqueue_review_todo_item_shows_todo_native_actions(monkeypatch):
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     text = adapter.sent[0]["text"]
-    assert "Available actions:" in text
+    assert "Fallback text actions:" in text
     assert "Complete TODO: /kb queue complete 1" in text
     assert "Keep unchanged: /kb queue keep 1" in text
     assert "Demote priority: /kb queue demote 1" in text
@@ -1369,7 +1405,8 @@ def test_kbqueue_review_item_renders_descriptor_preview_and_confirm_buttons(monk
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
     assert adapter.sent[0]["actions"]
-    guidance_action = adapter.sent[0]["actions"][0]
+    assert [action.label for action in adapter.sent[0]["actions"]] == ["Reject", "Ask LLM"]
+    guidance_action = adapter.sent[0]["actions"][1]
     assert guidance_action.label == "Ask LLM"
     guidance_card = guidance_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(guidance_card):

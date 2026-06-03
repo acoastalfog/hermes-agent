@@ -1945,9 +1945,21 @@ def _queue_action_decisions(item: dict[str, Any]) -> list[tuple[str, str]]:
     if any(decision in {"complete", "keep", "demote"} for decision, _ in decisions):
         order = {"complete": 0, "keep": 1, "demote": 2, "archive": 3, "skip": 4}
     else:
-        order = {"reject": 0, "archive": 1, "approve": 2, "skip": 3}
+        order = {"approve": 0, "reject": 1, "archive": 2, "skip": 3}
     decisions.sort(key=lambda pair: (order.get(pair[0], 99), pair[0]))
     return decisions
+
+
+def _queue_descriptor_decisions(item: dict[str, Any]) -> list[tuple[str, str]]:
+    descriptor_item = dict(item)
+    descriptor_item["safe_actions"] = [
+        action
+        for action in _safe_actions_for_item(item)
+        if action.get("dashboard_owned_write") is not True
+        and action.get("preview_tool")
+        and action.get("confirm_tool")
+    ]
+    return _queue_action_decisions(descriptor_item)
 
 
 def _queue_decision_commands(item: dict[str, Any], *, index: int) -> list[str]:
@@ -2005,23 +2017,6 @@ def _queue_descriptor_actions(
         ),
         None,
     )
-    if guidance_descriptor:
-        descriptor_copy = dict(guidance_descriptor)
-        actions.append(
-            KbAction(
-                label="Ask LLM",
-                action_id="queue.advisory_guidance",
-                handler=lambda callback_ctx, d=descriptor_copy: _render_descriptor_guidance(
-                    d,
-                    title="KB Queue LLM Guidance",
-                ),
-                metadata={
-                    "target_kind": "proposal_queue",
-                    "target_ref": _item_target(item),
-                    "advisory_only": True,
-                },
-            )
-        )
     for descriptor in _safe_actions_for_item(item):
         if descriptor.get("dashboard_owned_write") is True:
             continue
@@ -2052,6 +2047,23 @@ def _queue_descriptor_actions(
                     "decision": decision,
                     "preview_tool": preview_tool,
                     "confirm_tool": confirm_tool,
+                },
+            )
+        )
+    if guidance_descriptor:
+        descriptor_copy = dict(guidance_descriptor)
+        actions.append(
+            KbAction(
+                label="Ask LLM",
+                action_id="queue.advisory_guidance",
+                handler=lambda callback_ctx, d=descriptor_copy: _render_descriptor_guidance(
+                    d,
+                    title="KB Queue LLM Guidance",
+                ),
+                metadata={
+                    "target_kind": "proposal_queue",
+                    "target_ref": _item_target(item),
+                    "advisory_only": True,
                 },
             )
         )
@@ -2247,12 +2259,70 @@ def _queue_item_text(item: dict[str, Any], *, index: int) -> str:
     if proposal_ids:
         lines.append("")
         lines.append(f"Proposal ids: {', '.join(proposal_ids[:5])}")
-        lines.append("Available actions:")
-        lines.extend(_queue_decision_commands(item, index=index))
+        descriptor_actions = _queue_descriptor_decisions(item)
+        if descriptor_actions:
+            labels = [label for _decision, label in descriptor_actions]
+            lines.append("Decision rail: " + ", ".join(labels))
+            lines.append("Nothing applies until a kb-engine preview returns and you confirm from that preview.")
+        else:
+            lines.append("Fallback text actions:")
+            lines.extend(_queue_decision_commands(item, index=index))
     else:
         lines.append("")
         lines.append("This item did not include proposal ids, so Telegram cannot apply a decision yet. Use the KB workbench for details.")
     return "\n".join(lines)
+
+
+def _queue_review_text(data: Any, visible_items: list[Any], *, total: int | None, offset: int) -> str:
+    item = visible_items[0] if visible_items and isinstance(visible_items[0], dict) else None
+    if item is None:
+        return "KB Queue\nNo proposal previews returned."
+    current = offset + 1
+    total_label = total if total is not None else len(visible_items)
+    title = _item_title(item)
+    detail = _item_detail(item)
+    target = _item_target(item)
+    proposal_ids = _proposal_ids_for_item(item)
+    decisions = _queue_descriptor_decisions(item)
+    rail_labels = [label for _decision, label in decisions]
+    rail_labels.append("Details")
+    if _descriptor_advisory_guidance_for_item(item):
+        rail_labels.append("Ask LLM")
+    if _queue_item_at(data, 2) is not None:
+        rail_labels.append("Skip")
+    lines = [
+        "KB Review",
+        f"{current} of {total_label} · Visible scope",
+        title,
+    ]
+    if detail:
+        lines.append(_clip(detail, 260))
+    scope_bits: list[str] = []
+    if target:
+        scope_bits.append(target)
+    if proposal_ids:
+        scope_bits.append(f"{len(proposal_ids)} proposal{'s' if len(proposal_ids) != 1 else ''}")
+    if visible_items:
+        scope_bits.append(f"{len(visible_items)} visible")
+    if total is not None and total != len(visible_items):
+        scope_bits.append(f"{total} total")
+    if scope_bits:
+        lines.append("Scope: " + " · ".join(scope_bits))
+    if rail_labels:
+        lines.append("Rail: " + ", ".join(rail_labels[:6]))
+    lines.append("Nothing applies until kb-engine returns a preview lease and you confirm.")
+    waiting = max(len(visible_items) - 1, 0)
+    if waiting:
+        lines.append(f"{waiting} more item{'s' if waiting != 1 else ''} waiting in this Telegram window.")
+    return "\n".join(lines)
+
+
+def _descriptor_advisory_guidance_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    for descriptor in _safe_actions_for_item(item):
+        guidance = _descriptor_advisory_guidance(descriptor)
+        if guidance:
+            return guidance
+    return None
 
 
 def _selection_lines(selection: list[tuple[int, dict[str, Any]]]) -> list[str]:
@@ -3753,28 +3823,27 @@ def _queue_guided_actions(
     except Exception:
         return []
 
-    actions: list[Any] = [
-        KbAction(
-            label="Details",
-            action_id="queue.details",
-            handler=lambda callback_ctx: _render_queue_item(data, index=1, ctx=ctx, target=target),
-            metadata={
-                "target_kind": "proposal_queue",
-                "target_ref": _item_target(item),
-                "review_index": 1,
-            },
-        )
-    ]
-    actions.extend(
-        _queue_descriptor_actions(
-            ctx,
-            target,
-            item,
-            index=1,
-            preview_label_prefix=False,
-            limit=None,
-        )
+    descriptor_actions = _queue_descriptor_actions(
+        ctx,
+        target,
+        item,
+        index=1,
+        preview_label_prefix=False,
+        limit=None,
     )
+    guidance_actions = [action for action in descriptor_actions if getattr(action, "label", "") == "Ask LLM"]
+    decision_actions = [action for action in descriptor_actions if getattr(action, "label", "") != "Ask LLM"]
+    detail_action = KbAction(
+        label="Details",
+        action_id="queue.details",
+        handler=lambda callback_ctx: _render_queue_item(data, index=1, ctx=ctx, target=target),
+        metadata={
+            "target_kind": "proposal_queue",
+            "target_ref": _item_target(item),
+            "review_index": 1,
+        },
+    )
+    actions: list[Any] = [*decision_actions, detail_action, *guidance_actions]
     if _queue_item_at(data, 2) is not None:
         actions.append(
             KbAction(
@@ -4284,40 +4353,17 @@ def _render_queue(
         _store_iterative_state_from_item(session_id, visible_items[0])
     elif session_id:
         _clear_iterative_queue_reply_state(session_id)
-    lines = ["KB Queue"]
-    if count is not None:
-        lines.append(f"{count} pending")
     if not items:
+        lines = ["KB Queue"]
+        if count is not None:
+            lines.append(f"{count} pending")
         lines.append("No proposal previews returned.")
-    for idx, item in enumerate(visible_items, start=1):
-        if isinstance(item, dict):
-            lines.append("")
-            lines.append(f"{idx}. {_item_title(item)}")
-            target_path = _item_target(item)
-            kind = _item_kind(item)
-            preview = _item_detail(item)
-            if target_path:
-                lines.append(f"   Target: {target_path}")
-            if kind:
-                lines.append(f"   Type: {kind}")
-            if preview:
-                lines.append(f"   Summary: {_clip(preview, 220)}")
-            lines.append(f"   Review: /kb queue review {idx}")
-        else:
-            lines.append(f"{idx}. {_short(item)}")
-    if items:
-        lines.append("")
-        if offset:
-            lines.append(f"Reviewing item {offset + 1} now. Decision buttons open previews; nothing applies until Confirm.")
-        else:
-            lines.append("Reviewing item 1 now. Decision buttons open previews; nothing applies until Confirm.")
-        lines.append("Review session: kb-engine preview leases back every confirmed write.")
-        lines.append("Reply with a listed decision for item 1, or reply Reject all for the visible window.")
-        lines.append("Text fallback: /kb queue reject 1")
-        lines.append("Batch: /kb queue reject 1,2")
-        lines.append("Visible batch: reply Reject all to preview only the items shown here")
-        lines.append("Confirm from the preview button when available; text fallback: /kb queue reject 1 confirm")
-    return {"title": "KB Queue", "text": "\n".join(lines), "actions": _queue_guided_actions(ctx, target, data, session_id=session_id)}
+        return {"title": "KB Queue", "text": "\n".join(lines), "actions": []}
+    return {
+        "title": "KB Review",
+        "text": _queue_review_text(data, visible_items, total=total, offset=offset),
+        "actions": _queue_guided_actions(ctx, target, data, session_id=session_id),
+    }
 
 
 def _kb_root_command(args: str) -> tuple[str, str]:
