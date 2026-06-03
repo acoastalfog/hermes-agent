@@ -2200,6 +2200,375 @@ def _queue_item_review_metadata(item: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _review_target_payload(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    for candidate in (item.get("review_target"), raw.get("review_target")):
+        if isinstance(candidate, dict) and candidate.get("packet_type") == "guided_kb_review_target":
+            return dict(candidate)
+    return {}
+
+
+def _review_target_policy(item: Any) -> dict[str, Any]:
+    target = _review_target_payload(item)
+    policy = target.get("policy") if isinstance(target.get("policy"), dict) else {}
+    return dict(policy)
+
+
+def _control_actions_for_item(item: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for action in _safe_actions_for_item(item):
+        route = action.get("confirmed_write_route")
+        if isinstance(route, dict) and route.get("operation_id"):
+            result.append(action)
+    return result
+
+
+def _action_required_inputs(action: dict[str, Any]) -> list[str]:
+    route = action.get("confirmed_write_route") if isinstance(action.get("confirmed_write_route"), dict) else {}
+    values = route.get("required_input")
+    if values is None:
+        values = action.get("required_inputs")
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _control_action_decisions(item: dict[str, Any]) -> list[tuple[str, str]]:
+    decisions: list[tuple[str, str]] = []
+    for action in _control_actions_for_item(item):
+        route = action.get("confirmed_write_route") if isinstance(action.get("confirmed_write_route"), dict) else {}
+        operation_id = _short(route.get("operation_id") or _get_path(action, "params", "operation_id"), "")
+        if not operation_id:
+            continue
+        label = _short(action.get("label") or operation_id.rsplit(".", 1)[-1].title(), "")
+        if label:
+            decisions.append((operation_id, label))
+    order = {"todo.complete": 0, "todo.delegate": 1, "todo.archive": 2}
+    decisions.sort(key=lambda pair: (order.get(pair[0], 99), pair[0]))
+    return decisions
+
+
+def _queue_review_action_labels(item: dict[str, Any]) -> list[str]:
+    descriptor_labels = [label for _decision, label in _queue_descriptor_decisions(item)]
+    if descriptor_labels:
+        return descriptor_labels
+    control_labels = [label for _operation, label in _control_action_decisions(item)]
+    if control_labels:
+        return control_labels
+    target = _review_target_payload(item)
+    action_ids = target.get("action_ids") if isinstance(target.get("action_ids"), list) else []
+    labels: list[str] = []
+    for action_id in action_ids:
+        label = _review_action_label(action_id)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _review_action_label(action_id: Any) -> str:
+    value = str(action_id or "").strip()
+    aliases = {
+        "todo.complete": "Complete",
+        "todo.archive": "Archive",
+        "todo.delegate": "Delegate",
+        "open_situation": "Details",
+        "propose_situation_update": "Add Update",
+        "propose_child_commitment": "Add Commitment",
+    }
+    if value in aliases:
+        return aliases[value]
+    tail = value.rsplit(".", 1)[-1].replace("_", " ").strip()
+    return tail.title() if tail else ""
+
+
+def _review_guidance_available(item: dict[str, Any]) -> bool:
+    return bool(_descriptor_advisory_guidance_for_item(item) or _review_target_payload(item))
+
+
+def _render_review_target_guidance(item: dict[str, Any]) -> dict[str, Any]:
+    target = _review_target_payload(item)
+    if not target:
+        return {
+            "title": "KB Review Guidance",
+            "text": "KB Review Guidance\nNo backend review target metadata was available. Refresh the card before asking for guidance.",
+            "actions": [],
+        }
+    policy = target.get("policy") if isinstance(target.get("policy"), dict) else {}
+    scope = target.get("scope") if isinstance(target.get("scope"), dict) else {}
+    lines = [
+        "KB Review Guidance",
+        f"Target: {_short(target.get('title') or _item_title(item))}",
+        f"Kind: {_short(target.get('kind') or _item_kind(item), 'review target')}",
+        "Advisory only: cannot preview, confirm, or mutate KB state.",
+    ]
+    affected_count = scope.get("affected_count")
+    viewed_count = scope.get("viewed_count")
+    if affected_count is not None or viewed_count is not None:
+        lines.append(
+            "Scope: "
+            + " · ".join(
+                bit
+                for bit in (
+                    f"{affected_count} affected" if affected_count is not None else "",
+                    f"{viewed_count} viewed" if viewed_count is not None else "",
+                )
+                if bit
+            )
+        )
+    if policy:
+        lines.append(
+            "Write posture: "
+            + (
+                "preview and confirmed envelope required"
+                if policy.get("preview_required") or policy.get("confirmed_envelope_required")
+                else "read/proposal handoff only"
+            )
+        )
+    summary = _short(target.get("summary") or _item_detail(item), "")
+    if summary:
+        lines.append("Context: " + _clip(summary, 360))
+    return {"title": "KB Review Guidance", "text": "\n".join(lines), "actions": []}
+
+
+def _control_action_plan(action: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    route = action.get("confirmed_write_route") if isinstance(action.get("confirmed_write_route"), dict) else {}
+    operation_id = _short(route.get("operation_id") or _get_path(action, "params", "operation_id"), "")
+    arguments = route.get("arguments") if isinstance(route.get("arguments"), dict) else {}
+    label = _short(action.get("label") or operation_id.rsplit(".", 1)[-1].title(), "Apply")
+    return {
+        "summary": f"{label} from Telegram KB Review.",
+        "operations": [
+            {
+                "operation_id": operation_id,
+                "arguments": dict(arguments),
+                "reason": reason,
+            }
+        ],
+        "confirmation": {
+            "question": f"Confirm {label}?",
+            "operation_ids": [operation_id] if operation_id else [],
+        },
+    }
+
+
+def _control_action_object(action: dict[str, Any]) -> dict[str, Any]:
+    route = action.get("confirmed_write_route") if isinstance(action.get("confirmed_write_route"), dict) else {}
+    obj = route.get("object_ref") if isinstance(route.get("object_ref"), dict) else {}
+    return dict(obj)
+
+
+def _control_preview_text(label: str, item: dict[str, Any], payload: Any) -> str:
+    if isinstance(payload, dict) and payload.get("error"):
+        return f"KB Control Preview Failed\n{payload['error']}"
+    if not isinstance(payload, dict):
+        return "KB Control Preview\n" + _short(payload, "No structured response returned.")
+    lines = [
+        "KB Control Preview",
+        f"Action: {label}",
+        f"Target: {_item_title(item)}",
+        f"Status: {_short(payload.get('status') or payload.get('state'), 'preview')}",
+    ]
+    results = payload.get("results") if isinstance(payload.get("results"), list) else []
+    for result in results[:3]:
+        if isinstance(result, dict):
+            message = _short(result.get("message") or result.get("status"), "")
+            operation = _short(result.get("operation_id"), "")
+            if message or operation:
+                lines.append("- " + " · ".join(bit for bit in (operation, message) if bit))
+    lines.extend(_receipt_lines(payload, include_request=True))
+    if _preview_allows_confirmation(payload):
+        lines.append("Confirm only if this preview matches the action you intend.")
+    return "\n".join(lines)
+
+
+def _control_result_text(label: str, payload: Any) -> str:
+    if isinstance(payload, dict) and payload.get("error"):
+        return f"KB Control Result Failed\n{payload['error']}"
+    if not isinstance(payload, dict):
+        return "KB Control Result\n" + _short(payload, "No structured response returned.")
+    lines = [
+        "KB Control Result",
+        f"Action: {label}",
+        f"Status: {_short(payload.get('status') or payload.get('state'), 'unknown')}",
+    ]
+    lines.extend(_receipt_lines(payload, include_request=True))
+    results = payload.get("results") if isinstance(payload.get("results"), list) else []
+    for result in results[:3]:
+        if isinstance(result, dict):
+            message = _short(result.get("message") or result.get("status"), "")
+            operation = _short(result.get("operation_id"), "")
+            if message or operation:
+                lines.append("- " + " · ".join(bit for bit in (operation, message) if bit))
+    return "\n".join(lines)
+
+
+def _render_control_action_confirm(
+    ctx: Any,
+    target: str,
+    item: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    packet: dict[str, Any],
+    plan: dict[str, Any],
+    preview_payload: dict[str, Any],
+    callback_ctx: Any,
+) -> dict[str, Any]:
+    label = _short(action.get("label") or "Apply", "Apply")
+    actor = _queue_callback_actor(callback_ctx)
+    source = "Hermes Telegram Action Card"
+    session_id = _review_session_id(_queue_item_review_metadata(item)) or f"telegram-kb-control-{int(time.time())}"
+    envelope_payload = _result_payload(
+        ctx.dispatch_tool(
+            _descriptor_tool_name(target, "control.build_confirmed_envelope"),
+            {
+                "packet": packet,
+                "plan": plan,
+                "actor": actor,
+                "source": source,
+                "session_id": session_id,
+                "user_confirmation": {
+                    "confirmed": True,
+                    "confirmed_by": actor,
+                    "confirmation_text": f"Confirmed {label} from Telegram KB Review.",
+                    "preview_status": _short(preview_payload.get("status"), ""),
+                    "review_session_id": session_id,
+                },
+            },
+        )
+    )
+    envelope = envelope_payload.get("envelope") if isinstance(envelope_payload, dict) else None
+    if not isinstance(envelope, dict):
+        return {"title": "KB Control", "text": _control_result_text(label, envelope_payload), "actions": []}
+    applied = _result_payload(
+        ctx.dispatch_tool(
+            _descriptor_tool_name(target, "control.apply_confirmed"),
+            {"envelope": envelope},
+        )
+    )
+    return {"title": "KB Control", "text": _control_result_text(label, applied), "actions": []}
+
+
+def _render_control_action_preview(
+    ctx: Any,
+    target: str,
+    item: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    callback_ctx: Any,
+) -> dict[str, Any]:
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return {"title": "KB Control", "text": "KB Control\nAction buttons are unavailable. Refresh from /kb queue.", "actions": []}
+
+    label = _short(action.get("label") or "Apply", "Apply")
+    missing_inputs = _action_required_inputs(action)
+    if missing_inputs:
+        return {
+            "title": "KB Control",
+            "text": (
+                f"KB Control\n{label} needs additional input first: "
+                + ", ".join(missing_inputs)
+                + ". Refresh in a fuller workbench surface."
+            ),
+            "actions": [],
+        }
+    actor = _queue_callback_actor(callback_ctx)
+    source = "Hermes Telegram Action Card"
+    reason = f"{label} previewed from Telegram KB Review for {_item_title(item)}."
+    obj = _control_action_object(action)
+    packet = _result_payload(
+        ctx.dispatch_tool(
+            _descriptor_tool_name(target, "control.context"),
+            {"object": obj, "user_input": reason},
+        )
+    )
+    if not isinstance(packet, dict) or packet.get("error"):
+        return {"title": "KB Control", "text": _control_preview_text(label, item, packet), "actions": []}
+    plan = _control_action_plan(action, reason=reason)
+    preview_payload = _result_payload(
+        ctx.dispatch_tool(
+            _descriptor_tool_name(target, "control.apply_preview"),
+            {
+                "packet": packet,
+                "plan": plan,
+                "actor": actor,
+                "source": source,
+            },
+        )
+    )
+    actions: list[Any] = []
+    if isinstance(preview_payload, dict) and _preview_allows_confirmation(preview_payload):
+        preview_plan = preview_payload.get("plan") if isinstance(preview_payload.get("plan"), dict) else plan
+        actions.append(
+            KbAction(
+                label=f"Confirm {label}",
+                action_id="control.apply_confirmed.confirm",
+                handler=lambda confirm_ctx, p=dict(packet), pl=dict(preview_plan), pp=dict(preview_payload), a=dict(action): _render_control_action_confirm(
+                    ctx,
+                    target,
+                    item,
+                    a,
+                    packet=p,
+                    plan=pl,
+                    preview_payload=pp,
+                    callback_ctx=confirm_ctx,
+                ),
+                metadata={
+                    "target_kind": "todo",
+                    "target_ref": _item_target(item),
+                    "preview_required": True,
+                    "review_session_id": _review_session_id(_queue_item_review_metadata(item)),
+                },
+            )
+        )
+    return {"title": "KB Control", "text": _control_preview_text(label, item, preview_payload), "actions": actions}
+
+
+def _queue_control_actions(
+    ctx: Any,
+    target: str,
+    item: dict[str, Any],
+    *,
+    limit: int | None = 3,
+) -> list[Any]:
+    try:
+        from tools.kb_callback_registry import KbAction
+    except Exception:
+        return []
+    actions: list[Any] = []
+    for action in _control_actions_for_item(item):
+        label = _short(action.get("label") or _get_path(action, "confirmed_write_route", "operation_id"), "")
+        if not label:
+            continue
+        action_copy = dict(action)
+        actions.append(
+            KbAction(
+                label=label,
+                action_id=f"{_short(_get_path(action, 'confirmed_write_route', 'operation_id'), 'control.action')}.preview",
+                handler=lambda callback_ctx, a=action_copy: _render_control_action_preview(
+                    ctx,
+                    target,
+                    item,
+                    a,
+                    callback_ctx=callback_ctx,
+                ),
+                metadata={
+                    "target_kind": "todo",
+                    "target_ref": _item_target(item),
+                    "preview_required": True,
+                },
+            )
+        )
+    if limit is None:
+        return actions
+    return actions[:limit]
+
+
 def _queue_callback_actor(callback_ctx: Any) -> str:
     actor_id = str(getattr(callback_ctx, "actor_id", "") or "").strip()
     return f"telegram:{actor_id}" if actor_id else "telegram:operator"
@@ -2371,8 +2740,18 @@ def _queue_item_text(item: dict[str, Any], *, index: int) -> str:
             lines.append("Fallback text actions:")
             lines.extend(_queue_decision_commands(item, index=index))
     else:
+        control_actions = _control_action_decisions(item)
         lines.append("")
-        lines.append("This item did not include proposal ids, so Telegram cannot apply a decision yet. Use the KB workbench for details.")
+        if control_actions:
+            lines.append("Decision rail: " + ", ".join(label for _operation, label in control_actions))
+            lines.append("Nothing applies until kb-engine previews the control route and you confirm.")
+        elif _review_target_payload(item):
+            lines.append("Review target: backend-owned session metadata is available.")
+            lines.append("No direct write is available from this card; use Details or Ask LLM.")
+        else:
+            lines.append(
+                "This item did not include backend review metadata, so Telegram cannot apply a decision yet. Refresh the KB workbench."
+            )
     return "\n".join(lines)
 
 
@@ -2386,10 +2765,9 @@ def _queue_review_text(data: Any, visible_items: list[Any], *, total: int | None
     detail = _item_detail(item)
     target = _item_target(item)
     proposal_ids = _proposal_ids_for_item(item)
-    decisions = _queue_descriptor_decisions(item)
-    rail_labels = [label for _decision, label in decisions]
+    rail_labels = _queue_review_action_labels(item)
     rail_labels.append("Details")
-    if _descriptor_advisory_guidance_for_item(item):
+    if _review_guidance_available(item):
         rail_labels.append("Ask LLM")
     if _queue_item_at(data, 2) is not None:
         rail_labels.append("Skip")
@@ -2405,6 +2783,8 @@ def _queue_review_text(data: Any, visible_items: list[Any], *, total: int | None
         scope_bits.append(target)
     if proposal_ids:
         scope_bits.append(f"{len(proposal_ids)} proposal{'s' if len(proposal_ids) != 1 else ''}")
+    elif _review_target_payload(item):
+        scope_bits.append("1 review target")
     if visible_items:
         scope_bits.append(f"{len(visible_items)} visible")
     if total is not None and total != len(visible_items):
@@ -2413,7 +2793,13 @@ def _queue_review_text(data: Any, visible_items: list[Any], *, total: int | None
         lines.append("Scope: " + " · ".join(scope_bits))
     if rail_labels:
         lines.append("Rail: " + ", ".join(rail_labels[:6]))
-    lines.append("Nothing applies until kb-engine returns a preview lease and you confirm.")
+    policy = _review_target_policy(item)
+    if proposal_ids:
+        lines.append("Nothing applies until kb-engine returns a preview lease and you confirm.")
+    elif policy.get("preview_required") or _control_actions_for_item(item):
+        lines.append("Nothing applies until kb-engine previews the control route and you confirm.")
+    else:
+        lines.append("No direct write is available from this card; use Details or Ask LLM.")
     waiting = max(len(visible_items) - 1, 0)
     if waiting:
         lines.append(f"{waiting} more item{'s' if waiting != 1 else ''} waiting in this Telegram window.")
@@ -3244,11 +3630,12 @@ def _queue_summary_payload(
     ctx: Any,
     target: str,
     *,
+    scope: str = "proposals",
     limit: int = 5,
     offset: int = 0,
     selected_id: str = "",
 ) -> tuple[Any | None, list[str]]:
-    args = {"scope": "proposals", "limit": limit}
+    args = {"scope": _queue_requested_scope(scope), "limit": limit}
     if offset:
         args["offset"] = int(offset)
     if selected_id:
@@ -3263,6 +3650,41 @@ def _queue_summary_payload(
         ],
     )
     return data, errors
+
+
+def _queue_requested_scope(value: str | None) -> str:
+    scope = str(value or "").strip().lower()
+    aliases = {
+        "task": "tasks",
+        "tasks": "tasks",
+        "todo": "tasks",
+        "todos": "tasks",
+        "stale": "stale",
+        "delegated": "delegated",
+        "done": "done",
+        "proposal": "proposals",
+        "proposals": "proposals",
+        "queue": "proposals",
+        "review": "proposals",
+    }
+    return aliases.get(scope, "proposals")
+
+
+def _queue_scope_and_args(args: str) -> tuple[str, str]:
+    text = (args or "").strip()
+    if not text:
+        return "proposals", ""
+    head, _, tail = text.partition(" ")
+    scope = _queue_requested_scope(head)
+    if scope != "proposals" or head.strip().lower() in {"proposal", "proposals"}:
+        return scope, tail.strip()
+    return "proposals", text
+
+
+def _queue_payload_scope(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "proposals"
+    return _queue_requested_scope(data.get("scope") or data.get("queue_scope"))
 
 
 def _changed_paths(payload: Any) -> list[str]:
@@ -3862,7 +4284,8 @@ def _render_queue_item(data: Any, *, index: int, ctx: Any, target: str) -> dict[
             index=index,
             preview_label_prefix=False,
             limit=6,
-        ),
+        )
+        or _queue_control_actions(ctx, target, item, limit=6),
     }
 
 
@@ -3876,9 +4299,16 @@ def _render_queue_skip(
 ) -> dict[str, Any]:
     current_item = _queue_item_at(data, index)
     offset = _queue_offset(data)
+    scope = _queue_payload_scope(data)
     server_data = None
     if ctx is not None and target:
-        server_data, _errors = _queue_summary_payload(ctx, target, limit=5, offset=offset + index)
+        server_data, _errors = _queue_summary_payload(
+            ctx,
+            target,
+            scope=scope,
+            limit=5,
+            offset=offset + index,
+        )
     if server_data is not None:
         server_item = _queue_item_at(server_data, 1)
         current_ids = _proposal_ids_for_item(current_item) if isinstance(current_item, dict) else []
@@ -3936,6 +4366,21 @@ def _queue_guided_actions(
     )
     guidance_actions = [action for action in descriptor_actions if getattr(action, "label", "") == "Ask LLM"]
     decision_actions = [action for action in descriptor_actions if getattr(action, "label", "") != "Ask LLM"]
+    if not decision_actions:
+        decision_actions = _queue_control_actions(ctx, target, item, limit=None)
+    if not guidance_actions and _review_target_payload(item):
+        guidance_actions = [
+            KbAction(
+                label="Ask LLM",
+                action_id="review_target.guidance",
+                handler=lambda callback_ctx: _render_review_target_guidance(item),
+                metadata={
+                    "target_kind": _item_kind(item) or "review_target",
+                    "target_ref": _item_target(item),
+                    "advisory_only": True,
+                },
+            )
+        ]
     detail_action = KbAction(
         label="Details",
         action_id="queue.details",
@@ -4664,10 +5109,11 @@ def _card_for_command(
         )
         return _render_error("KB Runs", target, errors) if data is None else _render_runs(data)
     if command in {"kbqueue", "kbreview"}:
-        mode, indices, decision, confirm = _parse_queue_command_args(args, command=command)
+        queue_scope, queue_args = _queue_scope_and_args(args)
+        mode, indices, decision, confirm = _parse_queue_command_args(queue_args, command=command)
         if mode == "help":
             return _queue_command_help()
-        data, errors = _queue_summary_payload(ctx, target, limit=5)
+        data, errors = _queue_summary_payload(ctx, target, scope=queue_scope, limit=5)
         if data is None:
             return _render_error("KB Queue", target, errors)
         if mode == "review" and indices:

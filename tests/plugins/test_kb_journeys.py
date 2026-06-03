@@ -1147,6 +1147,214 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
     assert "Keio University" in skip_card["text"]
 
 
+def test_kb_queue_tasks_renders_nonproposal_review_card_and_control_preview(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    todo_item = {
+        "item_id": "todo_123",
+        "title": "Confirm Acme launch contract",
+        "kind": "todo",
+        "summary": "Use the workbench queue.",
+        "entity_path": "accounts/acme",
+        "safe_actions": [
+            {
+                "action_id": "todo.complete",
+                "label": "Complete",
+                "method": "control.apply_confirmed",
+                "mutation": "workspace_write",
+                "requires_confirmation": True,
+                "params": {"todo_id": "todo_123", "operation_id": "todo.complete"},
+                "confirmed_write_route": {
+                    "object_ref": {"kind": "todo", "id": "todo_123"},
+                    "operation_id": "todo.complete",
+                    "arguments": {"todo_id": "todo_123"},
+                    "required_input": [],
+                    "sequence": [
+                        "control.context",
+                        "control.apply_preview",
+                        "control.build_confirmed_envelope",
+                        "control.apply_confirmed",
+                    ],
+                },
+            },
+            {
+                "action_id": "todo.delegate",
+                "label": "Delegate",
+                "method": "control.apply_confirmed",
+                "mutation": "workspace_write",
+                "requires_confirmation": True,
+                "params": {"todo_id": "todo_123", "operation_id": "todo.delegate"},
+                "confirmed_write_route": {
+                    "object_ref": {"kind": "todo", "id": "todo_123"},
+                    "operation_id": "todo.delegate",
+                    "arguments": {"todo_id": "todo_123", "delegated_to": ""},
+                    "required_input": ["delegated_to"],
+                    "sequence": [
+                        "control.context",
+                        "control.apply_preview",
+                        "control.build_confirmed_envelope",
+                        "control.apply_confirmed",
+                    ],
+                },
+            },
+            {
+                "action_id": "todo.archive",
+                "label": "Archive",
+                "method": "control.apply_confirmed",
+                "mutation": "workspace_write",
+                "requires_confirmation": True,
+                "params": {"todo_id": "todo_123", "operation_id": "todo.archive"},
+                "confirmed_write_route": {
+                    "object_ref": {"kind": "todo", "id": "todo_123"},
+                    "operation_id": "todo.archive",
+                    "arguments": {"todo_id": "todo_123"},
+                    "required_input": [],
+                    "sequence": [
+                        "control.context",
+                        "control.apply_preview",
+                        "control.build_confirmed_envelope",
+                        "control.apply_confirmed",
+                    ],
+                },
+            },
+        ],
+        "raw": {
+            "review_session": {
+                "packet_type": "guided_kb_review_session",
+                "review_session_id": "todo_session_123",
+                "surface": "todo.review",
+                "scope": "tasks_queue",
+                "decision_scope": "explicit_ids",
+                "cursor": {
+                    "cursor_id": "todo_cursor_123",
+                    "displayed_count": 2,
+                    "candidate_count": 2,
+                    "item_ids": ["todo_123", "todo_456"],
+                    "viewed_item_ids": ["todo_123", "todo_456"],
+                },
+                "source": "workbench.queue",
+            },
+            "review_target": {
+                "packet_type": "guided_kb_review_target",
+                "target_id": "todo_123",
+                "kind": "todo",
+                "title": "Confirm Acme launch contract",
+                "summary": "Use the workbench queue.",
+                "scope": {
+                    "affected_ids": ["todo_123"],
+                    "affected_count": 1,
+                    "viewed_ids": ["todo_123", "todo_456"],
+                    "viewed_count": 2,
+                },
+                "action_ids": ["todo.complete", "todo.delegate", "todo.archive"],
+                "durable_action_ids": ["todo.complete", "todo.delegate", "todo.archive"],
+                "policy": {
+                    "semantic_owner": "kb-engine",
+                    "preview_required": True,
+                    "confirmed_envelope_required": True,
+                    "advisory_guidance_authoritative": False,
+                },
+            },
+        },
+    }
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "scope": "tasks",
+                    "total": 2,
+                    "items": [
+                        todo_item,
+                        {"item_id": "todo_456", "title": "Second TODO", "kind": "todo"},
+                    ],
+                }
+            },
+            "mcp_kb_engine_prod_control_context": {
+                "result": {"packet_type": "control_context", "object": {"kind": "todo", "id": "todo_123"}}
+            },
+            "mcp_kb_engine_prod_control_apply_preview": {
+                "result": {
+                    "status": "noop",
+                    "ok": True,
+                    "plan": {
+                        "summary": "Complete from Telegram KB Review.",
+                        "operations": [
+                            {
+                                "operation_id": "todo.complete",
+                                "arguments": {"todo_id": "todo_123"},
+                            }
+                        ],
+                    },
+                    "results": [{"operation_id": "todo.complete", "message": "dry run"}],
+                }
+            },
+            "mcp_kb_engine_prod_control_build_confirmed_envelope": {
+                "result": {"ok": True, "envelope": {"id": "env_123"}}
+            },
+            "mcp_kb_engine_prod_control_apply_confirmed": {
+                "result": {
+                    "status": "applied",
+                    "ok": True,
+                    "results": [{"operation_id": "todo.complete", "message": "applied"}],
+                }
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+    store = FakeSessionStore("session-tasks")
+
+    result = hook(event=_event("/kb queue tasks"), gateway=_authorized_gateway(adapter), session_store=store)
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls[0] == ("mcp_kb_engine_prod_queue_summary", {"scope": "tasks", "limit": 5})
+    text = adapter.sent[0]["text"]
+    assert "KB Review" in text
+    assert "Confirm Acme launch contract" in text
+    assert "Rail: Complete, Delegate, Archive, Details, Ask LLM, Skip" in text
+    assert "Nothing applies until kb-engine previews the control route and you confirm." in text
+    assert "/kb queue review 1" not in text
+    assert "Text fallback:" not in text
+    assert [action.label for action in adapter.sent[0]["actions"]] == [
+        "Complete",
+        "Delegate",
+        "Archive",
+        "Details",
+        "Ask LLM",
+        "Skip",
+    ]
+
+    guidance_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Ask LLM").handler(
+        SimpleNamespace(actor_id="user-1", actor_name="tester")
+    )
+    assert "Advisory only: cannot preview, confirm, or mutate KB state." in guidance_card["text"]
+
+    delegate_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Delegate").handler(
+        SimpleNamespace(actor_id="user-1", actor_name="tester")
+    )
+    assert "needs additional input first: delegated_to" in delegate_card["text"]
+
+    preview_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Complete").handler(
+        SimpleNamespace(actor_id="user-1", actor_name="tester")
+    )
+    assert "KB Control Preview" in preview_card["text"]
+    assert "Action: Complete" in preview_card["text"]
+    assert preview_card["actions"][0].label == "Confirm Complete"
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_control_context"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_control_apply_preview"
+    assert ctx.calls[-1][1]["plan"]["operations"][0]["operation_id"] == "todo.complete"
+
+    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    assert "KB Control Result" in confirm_card["text"]
+    assert "Status: applied" in confirm_card["text"]
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_control_build_confirmed_envelope"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_control_apply_confirmed"
+    assert ctx.calls[-2][1]["user_confirmation"]["review_session_id"] == "todo_session_123"
+
+
 def test_kb_queue_skip_uses_server_window_when_available(monkeypatch, tmp_path):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
