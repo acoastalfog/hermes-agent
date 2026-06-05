@@ -218,6 +218,44 @@ def _request_envelope(payload: Any) -> dict[str, Any]:
     return request if isinstance(request, dict) else {}
 
 
+def _dedupe_list(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _object_reference_lines(*packets: dict[str, Any], include_report_ref: bool = False) -> list[str]:
+    object_family = ""
+    report_refs: list[str] = []
+    related_refs: list[str] = []
+    for packet in packets:
+        if not isinstance(packet, dict):
+            continue
+        if not object_family:
+            object_family = _short(packet.get("object_family"), "")
+        if include_report_ref:
+            report_refs.extend(_id_list(packet.get("report_ref")))
+        report_refs.extend(_id_list(packet.get("report_refs")))
+        related_refs.extend(_id_list(packet.get("related_object_refs")))
+        related_refs.extend(_id_list(packet.get("related_objects")))
+    lines: list[str] = []
+    if object_family:
+        lines.append(f"Object family: {object_family}")
+    report_refs = _dedupe_list(report_refs)
+    related_refs = _dedupe_list(related_refs)
+    if report_refs:
+        lines.append(_id_line("Report refs", report_refs))
+    if related_refs:
+        lines.append(_id_line("Related objects", related_refs))
+    return lines
+
+
 def _receipt_lines(payload: Any, *, include_request: bool = False) -> list[str]:
     receipt = _request_receipt(payload)
     outcome = _request_outcome(payload)
@@ -244,6 +282,7 @@ def _receipt_lines(payload: Any, *, include_request: bool = False) -> list[str]:
         family = _short(outcome.get("family") or outcome.get("status"), "")
         if family:
             lines.append(f"Outcome: {family}")
+    lines.extend(_object_reference_lines(outcome, receipt))
     if include_request and request:
         kind = _short(request.get("kind") or request.get("request_kind"), "")
         route = _short(request.get("route"), "")
@@ -308,6 +347,7 @@ def _render_report_admission_packet(packet: dict[str, Any]) -> dict[str, Any]:
         lines.append(f"Event: {event_ref}" + (f" ({event_role})" if event_role else ""))
     if situation_ref:
         lines.append(f"Situation: {situation_ref}")
+    lines.extend(_object_reference_lines(packet, include_report_ref=True))
     if transfers:
         lines.append(f"Source files: {len(transfers)}")
     if changed_paths:
@@ -580,6 +620,7 @@ def _render_request_receipt_packet(
         ids = _id_list(packet.get(key))
         if ids:
             lines.append(_id_line(label, ids))
+    lines.extend(_object_reference_lines(packet))
     message = _short(packet.get("safe_message") or packet.get("message"), "")
     if message:
         lines.append(_clip(message, 260))

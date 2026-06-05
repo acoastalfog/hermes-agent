@@ -727,11 +727,17 @@ def test_dashboard_report_descriptor_renders_preview_confirm_receipts(monkeypatc
         "packet_type": "report_admission_receipt",
         "schema_version": 1,
         "status": "preview",
+        "object_family": "report",
         "report_ref": "reports/2026-06-future-of-ai-for-synbio",
+        "report_refs": ["reports/2026-06-future-of-ai-for-synbio"],
         "title": "Future of AI for Synbio",
         "event_ref": "events/2026-06-future-trends-forum",
         "event_role": "canonical_event",
         "situation_ref": "situations/2026-06-future-of-ai-for-synbio-prep",
+        "related_objects": [
+            "events/2026-06-future-trends-forum",
+            "situations/2026-06-future-of-ai-for-synbio-prep",
+        ],
         "source_transfers": [{"source_path": "/tmp/report.md", "destination_path": "files/report.md"}],
     }
     ctx = FakeContext(
@@ -795,6 +801,9 @@ def test_dashboard_report_descriptor_renders_preview_confirm_receipts(monkeypatc
     assert "Report Admission" in preview_card["text"]
     assert "Status: preview" in preview_card["text"]
     assert "Future of AI for Synbio" in preview_card["text"]
+    assert "Object family: report" in preview_card["text"]
+    assert "Report refs: reports/2026-06-future-of-ai-for-synbio" in preview_card["text"]
+    assert "Related objects: events/2026-06-future-trends-forum" in preview_card["text"]
     assert "No durable write has been made." in preview_card["text"]
     assert preview_card["actions"][0].label == "Confirm Admit report"
 
@@ -2047,6 +2056,32 @@ def test_kbqueue_receipt_renders_changed_queue_next_review_as_refresh_required()
     assert "Next review: refresh required" in card["text"]
     assert "proposal_ids_hash" in card["text"]
     assert "Next review from kb-engine" not in card["text"]
+    assert card["actions"] == []
+
+
+def test_request_receipt_renders_report_reference_fields():
+    from plugins import kb_journeys
+
+    card = kb_journeys._render_request_receipt_packet(
+        {
+            "packet_type": "request.receipt",
+            "state": "answered",
+            "route": "object.context",
+            "saved": False,
+            "object_family": "report",
+            "report_refs": ["reports/2026-06-future-of-ai-for-synbio"],
+            "related_object_refs": ["events/2026-06-future-trends-forum"],
+            "safe_message": "Rendered object context without mutating durable KB state.",
+        },
+        ctx=None,
+        target="kb_engine_prod",
+    )
+
+    assert card["title"] == "KB Request Receipt"
+    assert "Object family: report" in card["text"]
+    assert "Report refs: reports/2026-06-future-of-ai-for-synbio" in card["text"]
+    assert "Related objects: events/2026-06-future-trends-forum" in card["text"]
+    assert "Rendered object context" in card["text"]
     assert card["actions"] == []
 
 
