@@ -1215,6 +1215,9 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
             "mcp_kb_engine_prod_queue_decision_preview": {
                 "result": {"status": "preview", "ok": True, "plan": {"summary": "Reject 1 proposal."}}
             },
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": {
+                "result": {"status": "applied", "ok": True, "git": {"after": {"changed_count": 1}}}
+            },
         }
     )
     adapter = FakeKbActionsAdapter()
@@ -1236,17 +1239,24 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-guided",
         message="Reject",
-    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
+    ) == {
+        "mcp_kb_engine_prod_queue_decision_preview",
+        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
+    }
 
-    preview_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject").handler(
+    applied_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject").handler(
         SimpleNamespace(actor_id="user-1", actor_name="tester")
     )
-    if asyncio.iscoroutine(preview_card):
-        preview_card = asyncio.run(preview_card)
+    if asyncio.iscoroutine(applied_card):
+        applied_card = asyncio.run(applied_card)
 
-    assert "Queue reject preview" in preview_card["text"]
-    assert preview_card["actions"][0].label == "Confirm Reject"
-    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert "Queue Reject Applied" in applied_card["text"]
+    assert applied_card["actions"] == []
+    assert [call[0] for call in ctx.calls[-2:]] == [
+        "mcp_kb_engine_prod_queue_decision_preview",
+        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
+    ]
+    assert ctx.calls[-2][1]["proposal_ids"] == ["act_2"]
     assert ctx.calls[-1][1]["proposal_ids"] == ["act_2"]
 
     skip_card = next(action for action in adapter.sent[0]["actions"] if action.label == "Skip").handler(
@@ -1258,6 +1268,95 @@ def test_kb_queue_guided_card_buttons_preview_and_skip(monkeypatch, tmp_path):
     assert "Skipped item 1 locally. No KB state changed." in skip_card["text"]
     assert "Queue Item 2" in skip_card["text"]
     assert "Keio University" in skip_card["text"]
+
+
+def test_natural_language_review_proposals_uses_native_card_hook(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {
+                "result": {
+                    "total": 1,
+                    "items": [
+                        {
+                            "item_id": "accounts/bioelevate",
+                            "title": "Bioelevate",
+                            "kind": "proposal_entity",
+                            "summary": "Create entity after technical roadmap discussion.",
+                            "raw": {"proposal_ids": ["act_bio"]},
+                            "safe_actions": [
+                                {
+                                    "packet_type": "dashboard_action_descriptor",
+                                    "schema_version": 2,
+                                    "action_id": "review.entity_approve",
+                                    "label": "Approve",
+                                    "target_kind": "proposal_queue",
+                                    "target_ref": "accounts/bioelevate",
+                                    "preview_tool": "queue.decision_preview",
+                                    "confirm_tool": "queue.batch_decide_confirmed",
+                                    "params": {"proposal_ids": ["act_bio"], "decision": "approve"},
+                                    "dashboard_owned_write": False,
+                                    "requires_canonical_tool": True,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("Review proposals"), gateway=_authorized_gateway(adapter), session_store=FakeSessionStore("session-natural"))
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls[0][0] == "mcp_kb_engine_prod_queue_summary"
+    assert "KB Review" in adapter.sent[0]["text"]
+    assert "Bioelevate" in adapter.sent[0]["text"]
+    assert [action.label for action in adapter.sent[0]["actions"]][:1] == ["Approve"]
+
+
+def test_natural_language_kb_sync_starts_confirmed_workflow(monkeypatch, tmp_path):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb-engine-prod")
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_workflow_plan_request": {
+                "result": {
+                    "status": "confirmation_required",
+                    "workflow_id": "update_kb",
+                    "plan": {"risk": "write_broad"},
+                    "confirmation": {"token": "tok_sync"},
+                }
+            },
+            "mcp_kb_engine_prod_workflow_start_confirmed": {
+                "result": {"status": "started", "ok": True, "run_id": "gen_sync"}
+            },
+            "mcp_kb_engine_prod_run_watch": {
+                "result": {"status": "running", "terminal": False, "run_id": "gen_sync"}
+            },
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    result = hook(event=_event("Do a prod KB sync"), gateway=_authorized_gateway(adapter), session_store=FakeSessionStore("session-sync"))
+    _drain_scheduled_tasks()
+
+    assert result == {"action": "skip", "reason": "kb_journeys"}
+    assert [call[0] for call in ctx.calls] == [
+        "mcp_kb_engine_prod_workflow_plan_request",
+        "mcp_kb_engine_prod_workflow_start_confirmed",
+        "mcp_kb_engine_prod_run_watch",
+    ]
+    assert "Workflow start result" in adapter.sent[0]["text"]
 
 
 def test_kb_queue_tasks_renders_nonproposal_review_card_and_control_preview(monkeypatch, tmp_path):
@@ -1737,21 +1836,15 @@ def test_kbqueue_review_item_renders_descriptor_preview_and_confirm_buttons(monk
     assert "kb.review_guidance" in guidance_card["text"]
     assert "Advisory output never confirms" in guidance_card["text"]
 
-    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
-    assert preview_action.label == "Reject"
+    action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
+    assert action.label == "Reject"
 
-    preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(preview_card):
-        preview_card = asyncio.run(preview_card)
+    applied_card = action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(applied_card):
+        applied_card = asyncio.run(applied_card)
 
-    assert "Queue reject preview" in preview_card["text"]
-    assert preview_card["actions"][0].label == "Confirm Reject"
-
-    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(confirm_card):
-        confirm_card = asyncio.run(confirm_card)
-
-    assert "Queue Reject Applied" in confirm_card["text"]
+    assert "Queue Reject Applied" in applied_card["text"]
+    assert applied_card["actions"] == []
     assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
     assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
     assert ctx.calls[-1][1]["user_confirmation"]["confirmed"] is True
@@ -1834,25 +1927,16 @@ def test_kbqueue_descriptor_confirm_carries_lease_session_and_blocks_stale_resul
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
+    action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
+    assert action.metadata["preview_internal"] is True
 
-    preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(preview_card):
-        preview_card = asyncio.run(preview_card)
+    blocked_card = action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(blocked_card):
+        blocked_card = asyncio.run(blocked_card)
 
-    assert "Scope: Visible" in preview_card["text"]
-    assert "Review session: 1 item(s) · 1 proposal(s)" in preview_card["text"]
-    assert "lease_123" not in preview_card["text"]
-    assert preview_card["actions"][0].metadata["preview_lease"] is True
-    assert preview_card["actions"][0].metadata["review_session_id"] == "review_session_123"
-
-    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(confirm_card):
-        confirm_card = asyncio.run(confirm_card)
-
-    assert "Queue Reject Blocked" in confirm_card["text"]
-    assert "Preview lease expired" in confirm_card["text"]
-    assert "Queue Reject Applied" not in confirm_card["text"]
+    assert "Queue Reject Blocked" in blocked_card["text"]
+    assert "Preview lease expired" in blocked_card["text"]
+    assert "Queue Reject Applied" not in blocked_card["text"]
     assert [call[0] for call in ctx.calls] == [
         "mcp_kb_engine_prod_queue_summary",
         "mcp_kb_engine_prod_queue_decision_preview",
@@ -1898,91 +1982,117 @@ def test_kbqueue_confirm_advances_to_backend_next_review_card(monkeypatch):
         }
         for decision, label in (("approve", "Approve"), ("reject", "Reject"), ("archive", "Archive"))
     ]
-    ctx = FakeContext(
+    ctx = SequencedFakeContext(
         {
-            "mcp_kb_engine_prod_queue_summary": {
-                "result": {
-                    "total": 2,
-                    "items": [
-                        {
-                            "item_id": "accounts/acme",
-                            "title": "Acme",
-                            "kind": "proposal_entity",
-                            "summary": "Current proposal.",
-                            "raw": {"proposal_ids": ["act_acme"]},
-                            "safe_actions": [current_descriptor],
-                        }
-                    ],
-                }
-            },
-            "mcp_kb_engine_prod_queue_decision_preview": {
-                "result": {
-                    "status": "preview",
-                    "ok": True,
-                    "plan": {"summary": "Reject 1 proposal."},
-                    "preview_lease": {
-                        "preview_lease_id": "lease_acme",
-                        "review_session_id": "session_acme",
-                        "cursor_id": "cursor_acme",
-                        "decision_scope": "explicit_ids",
-                        "proposal_ids": ["act_acme"],
-                    },
-                    "review_session": {
-                        "review_session_id": "session_acme",
-                        "decision_scope": "explicit_ids",
-                        "cursor": {"cursor_id": "cursor_acme", "displayed_count": 1, "candidate_count": 2},
-                    },
-                }
-            },
-            "mcp_kb_engine_prod_queue_batch_decide_confirmed": {
-                "result": {
-                    "receipt": {
-                        "packet_type": "request.receipt",
-                        "schema_version": 1,
-                        "state": "applied",
-                        "route": "queue.batch_decide_confirmed",
-                        "saved": True,
-                        "ok": True,
-                        "affected_ids": ["act_acme"],
-                        "reviewed_count": 1,
-                        "confirmed_count": 1,
-                        "safe_message": "Applied queue decision to 1 proposal(s).",
-                        "next_review": {
-                            "packet_type": "guided_kb_review_next",
-                            "schema_version": 1,
-                            "status": "ready",
-                            "reason": "next_review_target_ready",
-                            "source_review_session_id": "session_acme",
-                            "source_cursor_id": "cursor_acme",
-                            "source_preview_lease_id": "lease_acme",
-                            "scope": {"affected_ids": ["act_acme"], "viewed_ids": ["act_acme"]},
-                            "review_session": {
-                                "packet_type": "guided_kb_review_session",
-                                "review_session_id": "session_globex",
-                                "decision_scope": "explicit_ids",
-                                "cursor": {
-                                    "cursor_id": "cursor_globex",
-                                    "displayed_count": 1,
-                                    "candidate_count": 1,
-                                    "item_ids": ["act_globex"],
-                                    "viewed_item_ids": ["act_globex"],
-                                },
-                            },
-                            "target": {
-                                "target_id": "accounts/globex",
+            "mcp_kb_engine_prod_queue_summary": [
+                {
+                    "result": {
+                        "total": 2,
+                        "items": [
+                            {
+                                "item_id": "accounts/acme",
+                                "title": "Acme",
                                 "kind": "proposal_entity",
-                                "title": "Globex",
-                                "summary": "Next backend-supplied proposal.",
-                                "entity_path": "accounts/globex",
-                                "status": "pending",
-                                "proposal_ids": ["act_globex"],
-                                "proposal_count": 1,
-                                "safe_actions": next_actions,
-                            },
-                        },
+                                "summary": "Current proposal.",
+                                "raw": {"proposal_ids": ["act_acme"]},
+                                "safe_actions": [current_descriptor],
+                            }
+                        ],
                     }
                 }
-            },
+            ],
+            "mcp_kb_engine_prod_queue_decision_preview": [
+                {
+                    "result": {
+                        "status": "preview",
+                        "ok": True,
+                        "plan": {"summary": "Reject 1 proposal."},
+                        "preview_lease": {
+                            "preview_lease_id": "lease_acme",
+                            "review_session_id": "session_acme",
+                            "cursor_id": "cursor_acme",
+                            "decision_scope": "explicit_ids",
+                            "proposal_ids": ["act_acme"],
+                        },
+                        "review_session": {
+                            "review_session_id": "session_acme",
+                            "decision_scope": "explicit_ids",
+                            "cursor": {"cursor_id": "cursor_acme", "displayed_count": 1, "candidate_count": 2},
+                        },
+                    }
+                },
+                {
+                    "result": {
+                        "status": "preview",
+                        "ok": True,
+                        "plan": {"summary": "Reject next proposal."},
+                        "preview_lease": {
+                            "preview_lease_id": "lease_globex",
+                            "review_session_id": "session_globex",
+                            "cursor_id": "cursor_globex",
+                            "decision_scope": "explicit_ids",
+                            "proposal_ids": ["act_globex"],
+                        },
+                        "review_session": {
+                            "review_session_id": "session_globex",
+                            "decision_scope": "explicit_ids",
+                            "cursor": {"cursor_id": "cursor_globex", "displayed_count": 1, "candidate_count": 1},
+                        },
+                    }
+                },
+            ],
+            "mcp_kb_engine_prod_queue_batch_decide_confirmed": [
+                {
+                    "result": {
+                        "receipt": {
+                            "packet_type": "request.receipt",
+                            "schema_version": 1,
+                            "state": "applied",
+                            "route": "queue.batch_decide_confirmed",
+                            "saved": True,
+                            "ok": True,
+                            "affected_ids": ["act_acme"],
+                            "reviewed_count": 1,
+                            "confirmed_count": 1,
+                            "safe_message": "Applied queue decision to 1 proposal(s).",
+                            "next_review": {
+                                "packet_type": "guided_kb_review_next",
+                                "schema_version": 1,
+                                "status": "ready",
+                                "reason": "next_review_target_ready",
+                                "source_review_session_id": "session_acme",
+                                "source_cursor_id": "cursor_acme",
+                                "source_preview_lease_id": "lease_acme",
+                                "scope": {"affected_ids": ["act_acme"], "viewed_ids": ["act_acme"]},
+                                "review_session": {
+                                    "packet_type": "guided_kb_review_session",
+                                    "review_session_id": "session_globex",
+                                    "decision_scope": "explicit_ids",
+                                    "cursor": {
+                                        "cursor_id": "cursor_globex",
+                                        "displayed_count": 1,
+                                        "candidate_count": 1,
+                                        "item_ids": ["act_globex"],
+                                        "viewed_item_ids": ["act_globex"],
+                                    },
+                                },
+                                "target": {
+                                    "target_id": "accounts/globex",
+                                    "kind": "proposal_entity",
+                                    "title": "Globex",
+                                    "summary": "Next backend-supplied proposal.",
+                                    "entity_path": "accounts/globex",
+                                    "status": "pending",
+                                    "proposal_ids": ["act_globex"],
+                                    "proposal_count": 1,
+                                    "safe_actions": next_actions,
+                                },
+                            },
+                        }
+                    }
+                },
+                {"result": {"status": "applied", "ok": True}},
+            ],
         }
     )
     adapter = FakeKbActionsAdapter()
@@ -1992,11 +2102,8 @@ def test_kbqueue_confirm_advances_to_backend_next_review_card(monkeypatch):
     _drain_scheduled_tasks()
 
     assert result == {"action": "skip", "reason": "kb_journeys"}
-    preview_action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
-    preview_card = preview_action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(preview_card):
-        preview_card = asyncio.run(preview_card)
-    confirm_card = preview_card["actions"][0].handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    action = next(action for action in adapter.sent[0]["actions"] if action.label == "Reject")
+    confirm_card = action.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
     if asyncio.iscoroutine(confirm_card):
         confirm_card = asyncio.run(confirm_card)
 
@@ -2008,16 +2115,18 @@ def test_kbqueue_confirm_advances_to_backend_next_review_card(monkeypatch):
     assert [action.label for action in confirm_card["actions"][:4]] == ["Approve", "Reject", "Archive", "Details"]
 
     next_reject = next(action for action in confirm_card["actions"] if action.label == "Reject")
-    next_preview = next_reject.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
-    if asyncio.iscoroutine(next_preview):
-        next_preview = asyncio.run(next_preview)
+    next_applied = next_reject.handler(SimpleNamespace(actor_id="user-1", actor_name="tester"))
+    if asyncio.iscoroutine(next_applied):
+        next_applied = asyncio.run(next_applied)
 
-    next_preview_args = ctx.calls[-1][1]
+    next_preview_args = ctx.calls[-2][1]
     assert next_preview_args["proposal_ids"] == ["act_globex"]
     assert next_preview_args["review_session_id"] == "session_globex"
     assert next_preview_args["cursor_id"] == "cursor_globex"
     assert next_preview_args["decision_scope"] == "explicit_ids"
     assert next_preview_args["session_id"] == "session_globex"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert "Queue Reject Applied" in next_applied["text"]
 
 
 def test_kbqueue_receipt_renders_changed_queue_next_review_as_refresh_required():
@@ -2299,22 +2408,25 @@ def test_kbqueue_reject_all_previews_visible_window_only(monkeypatch, tmp_path):
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-visible-all",
         message="Reject all",
-    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
+    ) == {
+        "mcp_kb_engine_prod_queue_decision_preview",
+        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
+    }
     assert preview == {"action": "skip", "reason": "kb_journeys"}
-    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_decision_preview"
-    assert ctx.calls[-1][1]["proposal_ids"] == [
+    assert ctx.calls[-2][0] == "mcp_kb_engine_prod_queue_decision_preview"
+    assert ctx.calls[-1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[-2][1]["proposal_ids"] == [
         "act_atomic",
         "act_nous",
         "act_palantir",
         "act_stellantis",
         "act_tsmc",
     ]
+    assert ctx.calls[-1][1]["proposal_ids"] == ctx.calls[-2][1]["proposal_ids"]
     assert ctx.calls[-1][1]["decision_scope"] == "all_viewed"
     assert ctx.calls[-1][1]["candidate_count"] == 11
     assert ctx.calls[-1][1]["displayed_count"] == 5
-    assert "Scope: visible Telegram queue window only" in adapter.sent[-1]["text"]
-    assert "To apply: /kb queue reject 1,2,3,4,5 confirm" in adapter.sent[-1]["text"]
-    assert "mcp_kb_engine_prod_queue_batch_decide_confirmed" not in [call[0] for call in ctx.calls]
+    assert "Queue Reject Applied" in adapter.sent[-1]["text"]
 
 
 def test_kbqueue_reject_all_without_visible_scope_does_not_fall_through(monkeypatch, tmp_path):
@@ -2447,11 +2559,13 @@ def test_kbqueue_bare_reply_uses_visible_iterative_item_state(monkeypatch, tmp_p
             "note": "Previewed from Telegram iterative queue reply for GTC Taipei 2026",
         },
     )
-    assert len(ctx.calls) == 1
+    assert ctx.calls[1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[1][1]["proposal_ids"] == ["act_gtc"]
+    assert ctx.calls[1][1]["decision"] == "archive"
     assert "act_huang1" not in json.dumps(ctx.calls)
     assert adapter.sent
     assert "GTC Taipei 2026" in adapter.sent[0]["text"]
-    assert "To apply: /kb queue archive 1 confirm" in adapter.sent[0]["text"]
+    assert "Queue Archive Applied" in adapter.sent[0]["text"]
 
 
 def test_kbqueue_bare_reply_records_options_presented_as_pending_action(monkeypatch, tmp_path):
@@ -2502,9 +2616,11 @@ def test_kbqueue_bare_reply_records_options_presented_as_pending_action(monkeypa
     assert ctx.calls[0][0] == "mcp_kb_engine_prod_queue_decision_preview"
     assert ctx.calls[0][1]["proposal_ids"] == ["act_hitachi"]
     assert ctx.calls[0][1]["decision"] == "reject"
-    assert len(ctx.calls) == 1
+    assert ctx.calls[1][0] == "mcp_kb_engine_prod_queue_batch_decide_confirmed"
+    assert ctx.calls[1][1]["proposal_ids"] == ["act_hitachi"]
+    assert ctx.calls[1][1]["decision"] == "reject"
     assert "Hitachi" in adapter.sent[0]["text"]
-    assert "To apply: /kb queue reject 1 confirm" in adapter.sent[0]["text"]
+    assert "Queue Reject Applied" in adapter.sent[0]["text"]
 
 
 def test_kbqueue_pending_action_exposes_scoped_mcp_tools(monkeypatch, tmp_path):
@@ -2525,7 +2641,10 @@ def test_kbqueue_pending_action_exposes_scoped_mcp_tools(monkeypatch, tmp_path):
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-posture",
         message="Reject",
-    ) == {"mcp_kb_engine_prod_queue_decision_preview"}
+    ) == {
+        "mcp_kb_engine_prod_queue_decision_preview",
+        "mcp_kb_engine_prod_queue_batch_decide_confirmed",
+    }
     assert kb_journeys.scoped_mcp_tool_allowlist_for_message(
         session_id="session-posture",
         message="keep me posted",
