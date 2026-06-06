@@ -1459,6 +1459,13 @@ AUTHOR_MAP = {
     "wasdhkzk@gmail.com": "whyhkzk",  # PR #32407 (sandbox-mirror inner-container guard; commits authored as whyhkzk + zhukun)
     "leonard@sellem.me": "leonardsellem",  # PR #37405 (desktop WS origin guard on remote/Tailscale binds)
     "42903577+ohMyJason@users.noreply.github.com": "ohMyJason",  # PR #29810 (discover_models in custom_providers section 4)
+    # v0.16.0 additions
+    "ilonagaja509-glitch@users.noreply.github.com": "ilonagaja509-glitch",
+    "pepelax@users.noreply.github.com": "pepelax",
+    "pochi-gio@users.noreply.github.com": "pochi-gio",
+    "redpiggy-cyber@users.noreply.github.com": "redpiggy-cyber",
+    "roadhero@users.noreply.github.com": "roadhero",
+    "vinoth12940@users.noreply.github.com": "vinoth12940",
 }
 
 
