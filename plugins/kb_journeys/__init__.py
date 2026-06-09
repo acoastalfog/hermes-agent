@@ -2553,12 +2553,26 @@ def _queue_preview_metadata(payload: Any) -> dict[str, Any]:
     if review_session:
         metadata["review_session"] = review_session
         metadata["preview_session"] = review_session
+    if isinstance(payload, dict):
+        expected_before_hash = _short(
+            payload.get("expected_before_hash")
+            or payload.get("expectedBeforeHash")
+            or payload.get("before_hash")
+            or _get_path(payload, "preview", "expected_before_hash")
+            or _get_path(payload, "preview", "before_hash"),
+            "",
+        )
+        if expected_before_hash:
+            metadata["expected_before_hash"] = expected_before_hash
     return metadata
 
 
 def _apply_queue_preview_metadata(args: dict[str, Any], metadata: dict[str, Any]) -> None:
     if not metadata:
         return
+    expected_before_hash = _short(metadata.get("expected_before_hash"), "")
+    if expected_before_hash:
+        args.setdefault("expected_before_hash", expected_before_hash)
     review_session_id = _review_session_id(metadata)
     if review_session_id:
         args.setdefault("review_session_id", review_session_id)

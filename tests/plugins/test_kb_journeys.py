@@ -1096,6 +1096,7 @@ def test_kb_review_lifecycle_renders_readonly_packet_and_descriptor_preview(monk
                     "workflow": "Lifecycle Review",
                     "stewardship_area": "KB Stewardship",
                     "mutation_performed": False,
+                    "expected_before_hash": "life-before-hash-1",
                     "proposal_count": 1,
                     "proposals": [
                         {
@@ -1172,6 +1173,7 @@ def test_kb_review_lifecycle_renders_readonly_packet_and_descriptor_preview(monk
     assert ctx.calls[-1][0] == "mcp_kb_engine_prod_lifecycle_proposal_confirmed"
     assert ctx.calls[-1][1]["user_confirmation"]["confirmed"] is True
     assert ctx.calls[-1][1]["user_confirmation"]["preview_required"] is True
+    assert ctx.calls[-1][1]["expected_before_hash"] == "life-before-hash-1"
     assert ctx.calls[-1][1]["actor"] == "telegram:user-1"
     assert ctx.calls[-1][1]["source"] == "Hermes Telegram Action Card"
 
