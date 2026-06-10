@@ -1178,6 +1178,84 @@ def test_kb_review_lifecycle_renders_readonly_packet_and_descriptor_preview(monk
     assert ctx.calls[-1][1]["source"] == "Hermes Telegram Action Card"
 
 
+def test_kb_review_and_review_queue_prose_render_lifecycle_update_packet(monkeypatch):
+    from plugins.kb_journeys import build_pre_gateway_dispatch_hook
+
+    monkeypatch.setenv("HERMES_KB_MCP_TARGET", "kb_engine_prod")
+    lifecycle_update_packet = {
+        "kind": "lifecycle_update.packet",
+        "workflow": "Lifecycle Review",
+        "stewardship_area": "KB Stewardship",
+        "target": "review_queue",
+        "mutation_performed": False,
+        "raw_private_source_text_copied": False,
+        "source_manifest": {
+            "source_count": 2,
+            "sources": [
+                {
+                    "kind": "inbox",
+                    "source_ref": "source:review-mail",
+                    "title": "Review queue follow-up",
+                    "status": "included",
+                },
+                {
+                    "kind": "doc",
+                    "source_ref": "https://example.invalid/private-raw-source",
+                    "title": "Lifecycle handoff",
+                },
+            ],
+        },
+        "surface_authority_map": {
+            "Telegram": "read_surface",
+            "kb_engine_prod": {"authority": "durable_semantics"},
+        },
+        "candidates": [
+            {
+                "candidate_id": "cand_1",
+                "title": "Archive stale situation",
+                "target_ref": "situations/2026-04-old-launch",
+                "recommended_action": "draft_archive_proposal",
+                "summary": "Closure evidence is strong enough to draft a lifecycle proposal.",
+                "candidate_actions": [{"label": "Draft archive proposal"}],
+                "evidence_refs": ["source:review-mail", "https://example.invalid/private-source"],
+            }
+        ],
+        "source_body": "private source body should not render",
+    }
+    ctx = FakeContext(
+        {
+            "mcp_kb_engine_prod_queue_summary": {"result": lifecycle_update_packet},
+        }
+    )
+    adapter = FakeKbActionsAdapter()
+    hook = build_pre_gateway_dispatch_hook(ctx)
+
+    prose = hook(event=_event("what is in the review queue"), gateway=_authorized_gateway(adapter), session_store=None)
+    slash = hook(event=_event("/kb review"), gateway=_authorized_gateway(adapter), session_store=None)
+    _drain_scheduled_tasks()
+
+    assert prose == {"action": "skip", "reason": "kb_journeys"}
+    assert slash == {"action": "skip", "reason": "kb_journeys"}
+    assert ctx.calls == [
+        ("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5}),
+        ("mcp_kb_engine_prod_queue_summary", {"scope": "proposals", "limit": 5}),
+    ]
+    for sent in adapter.sent:
+        text = sent["text"]
+        assert "Lifecycle Update" in text
+        assert "Workflow: Lifecycle Review" in text
+        assert "Mutation: none" in text
+        assert "Raw private source text copied: no" in text
+        assert "Sources: 2" in text
+        assert "inbox - source:review-mail - Review queue follow-up" in text
+        assert "Authority map: Telegram=read_surface; kb_engine_prod=durable_semantics" in text
+        assert "Archive stale situation" in text
+        assert "Candidate actions: Draft archive proposal, draft_archive_proposal" in text
+        assert "No durable write has been made." in text
+        assert "private source body" not in text
+        assert "example.invalid" not in text
+
+
 def test_dashboard_proposal_queue_descriptor_uses_generic_preview_confirm_with_lease(monkeypatch):
     from plugins.kb_journeys import build_pre_gateway_dispatch_hook
 
@@ -2540,6 +2618,86 @@ def test_semantic_write_receipt_supports_offline_status_aliases():
     assert "Transaction: offline-txn-7" in text
     assert "Objects: accounts/mistral" in text
     assert "Operations: semantic.update" in text
+
+
+def test_semantic_write_shadow_preview_renders_manifest_authority_and_receipt_statuses():
+    from plugins import kb_journeys
+
+    card = kb_journeys._render_supported_result_packet(
+        {
+            "result": {
+                "kind": "semantic_write_through.shadow_preview",
+                "shadow_mode": True,
+                "mutation_performed": False,
+                "raw_private_source_text_copied": False,
+                "durable_write_families": ["situation.lifecycle", "report.provenance"],
+                "classification": {
+                    "family": "lifecycle",
+                    "intent": "semantic_update",
+                    "confidence": "high",
+                },
+                "source_manifest": {
+                    "sources": [
+                        {"kind": "inbox", "source_ref": "source:closeout", "title": "Closeout note"},
+                        {"kind": "doc", "source_ref": "/Users/acosta/private/raw.md", "title": "Private raw"},
+                    ]
+                },
+                "surface_authority_map": {
+                    "Telegram": "read_surface",
+                    "kb_engine_prod": {"authority": "durable_write_authority"},
+                },
+                "semantic_preview": {
+                    "status": "ready",
+                    "summary": "Would update lifecycle state from the canonical preview.",
+                    "object_refs": ["situations/2026-06-acme-launch", "anthony@example.com"],
+                    "operations": [{"operation_id": "object.semantic_update_preview"}],
+                    "source_body": "private source body should not render",
+                },
+                "comparison": {
+                    "status": "shadow_matches_preview",
+                    "differences": ["candidate action wording differs"],
+                    "summary": "Shadow and canonical preview agree on durable family.",
+                },
+                "receipt_status": {
+                    "prod_write_status": "shadow_not_applied",
+                    "publication": {"status": "not_published"},
+                    "reconciliation_status": "not_needed",
+                    "shadow_receipt_status": "shadow_preview_recorded",
+                },
+                "candidate_actions": [
+                    {"label": "Preview canonical write", "action_id": "object.semantic_update_preview"}
+                ],
+                "token": "sk-secret-token",
+            }
+        }
+    )
+
+    assert card["title"] == "Semantic Write Shadow Preview"
+    text = card["text"]
+    assert "Shadow mode: yes" in text
+    assert "Mutation: none" in text
+    assert "Raw private source text copied: no" in text
+    assert "Durable write families: situation.lifecycle, report.provenance" in text
+    assert "Classification: lifecycle / semantic_update / high" in text
+    assert "Sources: 2" in text
+    assert "inbox - source:closeout - Closeout note" in text
+    assert "Authority map: Telegram=read_surface; kb_engine_prod=durable_write_authority" in text
+    assert "Preview status: ready" in text
+    assert "Preview objects: situations/2026-06-acme-launch" in text
+    assert "Preview operations: object.semantic_update_preview" in text
+    assert "Comparison: shadow_matches_preview" in text
+    assert "Differences: 1" in text
+    assert "Prod write: shadow_not_applied" in text
+    assert "Publication: not_published" in text
+    assert "Reconciliation: not_needed" in text
+    assert "Shadow receipt: shadow_preview_recorded" in text
+    assert "Candidate actions: Preview canonical write, object.semantic_update_preview" in text
+    assert "No durable write has been made." in text
+    assert "private source body" not in text
+    assert "anthony@example.com" not in text
+    assert "/Users/acosta" not in text
+    assert "sk-secret-token" not in text
+    assert card["actions"] == []
 
 
 def test_kbqueue_decision_can_be_previewed_and_confirmed_by_text_command(monkeypatch):
