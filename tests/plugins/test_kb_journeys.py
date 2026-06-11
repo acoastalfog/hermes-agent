@@ -698,11 +698,18 @@ def test_kb_sync_command_previews_sync_workflow(monkeypatch, tmp_path):
         },
     )
     text = adapter.sent[0]["text"]
-    assert "KB Sync Preview" in text
+    assert "KB Sync Journey Preview" in text
     assert "Request: /kb sync" in text
+    assert "Journey: kb_sync" in text
+    assert "Preview sync: source evidence refresh" in text
     assert "Receipt: ready_to_confirm" in text
-    assert "Outcome: workflow_start_plan" in text
-    assert "To start: /kb sync confirm" in text
+    assert "Confirm sync: /kb sync confirm" in text
+    assert "workflow_start_plan" not in text
+    assert "Workflow:" not in text
+    assert "update_kb" not in text
+    assert "workflow.plan_request" not in text
+    assert "workflow.start_confirmed" not in text
+    assert "run.watch" not in text
     assert adapter.sent[0]["actions"] == []
 
 
@@ -773,7 +780,11 @@ def test_kb_sync_confirm_consumes_fresh_preview_lease(monkeypatch, tmp_path):
     assert envelope["plan"]["request_id"] == "sync_preview_1"
     assert envelope["user_confirmation"]["preview_required"] is True
     assert envelope["user_confirmation"]["preview_lease"]["preview_lease_id"].startswith("sha256:")
-    assert "Workflow start result" in adapter.sent[-1]["text"]
+    assert "KB sync journey result" in adapter.sent[-1]["text"]
+    assert "Effect: sync_started" in adapter.sent[-1]["text"]
+    assert "workflow_run" not in adapter.sent[-1]["text"]
+    assert "update_kb" not in adapter.sent[-1]["text"]
+    assert "workflow.start_confirmed" not in adapter.sent[-1]["text"]
 
 
 def test_kb_sync_confirm_fails_closed_for_stale_or_wrong_actor_preview(monkeypatch, tmp_path):
@@ -3711,19 +3722,30 @@ def test_run_command_previews_and_starts_with_confirmed_envelope(monkeypatch):
             "session_id": ctx.calls[0][1]["session_id"],
         },
     )
-    assert "Workflow Preview" in adapter.sent[0]["text"]
+    assert "KB Sync Journey Preview" in adapter.sent[0]["text"]
+    assert "Journey: kb_sync" in adapter.sent[0]["text"]
     assert "Receipt: ready_to_confirm" in adapter.sent[0]["text"]
-    assert "Outcome: workflow_start_plan" in adapter.sent[0]["text"]
-    assert "To start: /kb run kb sync confirm" in adapter.sent[0]["text"]
+    assert "Confirm sync: /kb run kb sync confirm" in adapter.sent[0]["text"]
+    assert "workflow_start_plan" not in adapter.sent[0]["text"]
+    assert "Workflow:" not in adapter.sent[0]["text"]
+    assert "update_kb" not in adapter.sent[0]["text"]
+    assert "workflow.plan_request" not in adapter.sent[0]["text"]
+    assert "workflow.start_confirmed" not in adapter.sent[0]["text"]
+    assert "run.watch" not in adapter.sent[0]["text"]
     assert adapter.sent[0]["actions"] == []
 
     started = hook(event=_event("/kb run kb sync confirm"), gateway=_authorized_gateway(adapter), session_store=None)
     _drain_scheduled_tasks()
 
     assert started == {"action": "skip", "reason": "kb_journeys"}
-    assert "Workflow start result" in adapter.sent[1]["text"]
-    assert "Receipt: workflow_running" in adapter.sent[1]["text"]
-    assert "Effect: workflow_run" in adapter.sent[1]["text"]
+    assert "KB sync journey result" in adapter.sent[1]["text"]
+    assert "Receipt: sync_running" in adapter.sent[1]["text"]
+    assert "workflow_running" not in adapter.sent[1]["text"]
+    assert "Effect: sync_started" in adapter.sent[1]["text"]
+    assert "workflow_run" not in adapter.sent[1]["text"]
+    assert "update_kb" not in adapter.sent[1]["text"]
+    assert "workflow.start_confirmed" not in adapter.sent[1]["text"]
+    assert "run.watch" not in adapter.sent[1]["text"]
     assert "Run:" not in adapter.sent[1]["text"]
     assert "gen-123" not in adapter.sent[1]["text"]
     assert "Initial progress: Classifying" in adapter.sent[1]["text"]
