@@ -2510,9 +2510,22 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        ``rich_markdown`` is an OPTIONAL RAW-markdown rendering of the same body
+        (separate from the MarkdownV2-escaped ``content``). When supplied and
+        rich delivery is eligible (capability present, rich not latched off,
+        content fits the rich cap, no TDesktop details+math crash shape), it is
+        delivered as a single Bot API 10.1 ``sendRichMessage`` so tables /
+        section headings / bullet lists render natively. This is what makes the
+        action-LESS kb_journeys cards (status / today / status-proof) render
+        rich. On any capability/BadRequest/oversize rejection the send degrades
+        transparently to the MarkdownV2 ``content`` path below — identical to
+        today when ``rich_markdown`` is None.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -2523,8 +2536,31 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
+            # Action-LESS rich card fast-path: when the caller supplied a
+            # separate RAW-markdown payload (the kb_journeys status/today
+            # cards), deliver THAT via sendRichMessage while the MarkdownV2
+            # ``content`` stays the fallback. Mirrors the legacy content
+            # fast-path below but sources the rich body from rich_markdown.
+            # Gated by the same expect_edits + eligibility checks; any
+            # capability/permanent rejection returns None and falls through to
+            # the MarkdownV2 ``content`` send. A transient failure is returned
+            # directly (must NOT be legacy-resent).
+            if (
+                rich_markdown
+                and not (metadata or {}).get("expect_edits")
+                and self._rich_eligible(rich_markdown)
+            ):
+                rich_result = await self._try_send_rich(chat_id, rich_markdown, reply_to, metadata)
+                if rich_result is not None:
+                    if rich_result.success:
+                        try:
+                            await self.send_typing(chat_id, metadata=metadata)
+                        except Exception:
+                            pass  # Typing failures are non-fatal
+                    return rich_result
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability

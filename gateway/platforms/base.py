@@ -2315,17 +2315,25 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
         """
         Send a message to a chat.
-        
+
         Args:
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
             metadata: Additional platform-specific options
-        
+            rich_markdown: OPTIONAL RAW-markdown rendering of the same message
+                body. Platforms that support Bot API 10.1 rich messages
+                (Telegram) may deliver this as a single native rich message so
+                tables / section headings / bullet lists render server-side;
+                every other transport ignores it and sends ``content``
+                unchanged (the legacy contract), so callers — e.g. the
+                action-LESS kb_journeys cards — can pass it unconditionally.
+
         Returns:
             SendResult with success status and message ID
         """

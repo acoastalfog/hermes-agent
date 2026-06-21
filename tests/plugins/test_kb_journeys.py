@@ -4427,3 +4427,101 @@ def test_send_card_skips_rich_markdown_for_legacy_adapter_signature():
     assert len(adapter.sent) == 1
     assert adapter.sent[0]["text"] == "*KB*\nstatus"
     assert "rich_markdown" not in adapter.sent[0]
+
+
+class RichSendAdapter(FakeAdapter):
+    """Adapter whose action-LESS ``send`` accepts the rich_markdown kwarg.
+
+    Mirrors the telegram adapter's rich-aware send signature so we can assert
+    that the action-LESS card path actually forwards the rich payload to the
+    SEND call (not just builds it in the render dict).
+    """
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None, rich_markdown=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "text": content,
+                "actions": [],
+                "reply_to": reply_to,
+                "metadata": metadata,
+                "rich_markdown": rich_markdown,
+            }
+        )
+        return SimpleNamespace(success=True, message_id="1")
+
+
+def test_send_card_forwards_rich_markdown_on_actionless_send_path():
+    """Regression: an action-LESS card (status / today / status-proof) MUST
+    forward its rich_markdown to ``adapter.send`` so the card renders rich.
+
+    Before the both-paths fix, _send_card only forwarded rich_markdown on the
+    actions -> send_kb_actions branch; the action-LESS else branch called plain
+    ``adapter.send(chat_id, text, reply_to, metadata)`` and silently DROPPED the
+    rich payload, so the status/today cards never rendered rich. This test
+    drives the actual send path and asserts the rich kwarg arrives.
+    """
+    from plugins.kb_journeys import _send_card
+
+    adapter = RichSendAdapter()
+    asyncio.run(
+        _send_card(
+            adapter,
+            _event("/kb status"),
+            {
+                "title": "KB Status",
+                "text": "*KB Status*\nReadiness: ready",
+                "rich_markdown": "## KB Status\n\n| Field | Value |\n| --- | --- |\n| Readiness | ready |",
+                "actions": [],
+            },
+        )
+    )
+    assert len(adapter.sent) == 1
+    sent = adapter.sent[0]
+    # No send_kb_actions on this adapter and no actions on the card, so it must
+    # have gone through the action-LESS ``send`` path.
+    assert sent["actions"] == []
+    # The rich payload reached the SEND call (this is the load-bearing assert
+    # that FAILS on the pre-fix diff where the else branch drops rich_markdown).
+    assert sent["rich_markdown"] == (
+        "## KB Status\n\n| Field | Value |\n| --- | --- |\n| Readiness | ready |"
+    )
+    # The MarkdownV2 fallback body still rides along unchanged.
+    assert sent["text"] == "*KB Status*\nReadiness: ready"
+
+
+def test_send_card_actionless_skips_rich_for_legacy_send_signature():
+    """Dual-source skew guard for the action-LESS path: a pre-rich ``send``
+    signature (no rich_markdown param) must NOT receive the kwarg."""
+    from plugins.kb_journeys import _send_card
+
+    # FakeAdapter.send has NO rich_markdown param and no send_kb_actions.
+    adapter = FakeAdapter()
+    asyncio.run(
+        _send_card(
+            adapter,
+            _event("/kb status"),
+            {
+                "title": "KB Status",
+                "text": "*KB Status*\nReadiness: ready",
+                "rich_markdown": "## KB Status\n\n| Field | Value |\n| --- | --- |",
+                "actions": [],
+            },
+        )
+    )
+    assert len(adapter.sent) == 1
+    # Delivered via the legacy text path; rich_markdown was never forwarded.
+    assert adapter.sent[0]["text"] == "*KB Status*\nReadiness: ready"
+    assert "rich_markdown" not in adapter.sent[0]
+
+
+def test_rich_heading_collapses_newlines_and_pipes():
+    """Section titles flow straight into _rich_heading; a stray newline or pipe
+    must be collapsed so it can't break the heading or bleed into a table."""
+    from plugins.kb_journeys import _rich_heading
+
+    out = _rich_heading("Now | Review\nSection")
+    assert "\n" not in out
+    assert "|" not in out
+    assert out.startswith("## ")

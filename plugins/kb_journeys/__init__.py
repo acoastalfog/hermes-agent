@@ -323,8 +323,15 @@ def _rich_cell(value: Any) -> str:
 
 
 def _rich_heading(label: str) -> str:
-    """A level-2 rich-markdown heading (Telegram renders it as a SectionHeading)."""
-    return f"## {(label or '').strip()}".rstrip()
+    """A level-2 rich-markdown heading (Telegram renders it as a SectionHeading).
+
+    The label is run through the same newline/pipe collapse used for table
+    cells (``_RICH_CELL_RE``) so a dashboard section title carrying a stray
+    newline or pipe can never break the heading line or bleed into the
+    following table grammar.
+    """
+    collapsed = _RICH_CELL_RE.sub(" ", (label or "")).strip()
+    return f"## {collapsed}".rstrip()
 
 
 def _rich_kv_table(title: str, pairs: list[tuple[str, Any]]) -> str:
@@ -6860,7 +6867,24 @@ def _send_kb_actions_accepts_rich(adapter: Any) -> bool:
     param, forwarding it would raise ``TypeError``; this guard keeps the legacy
     text/actions path intact in that case.
     """
-    fn = getattr(adapter, "send_kb_actions", None)
+    return _callable_accepts_rich(getattr(adapter, "send_kb_actions", None))
+
+
+def _send_accepts_rich(adapter: Any) -> bool:
+    """True when ``adapter.send`` accepts a ``rich_markdown`` kwarg.
+
+    Mirrors :func:`_send_kb_actions_accepts_rich` for the action-LESS path. The
+    status/today/proof cards carry a ``rich_markdown`` payload but NO actions,
+    so they go through plain ``adapter.send``; only telegram's ``send`` was
+    extended with the rich param. Other transports (and any pre-rich telegram
+    build, given the dual-source skew) keep the legacy two-arg ``send``, so we
+    must NOT forward ``rich_markdown`` to them (it would raise ``TypeError``).
+    """
+    return _callable_accepts_rich(getattr(adapter, "send", None))
+
+
+def _callable_accepts_rich(fn: Any) -> bool:
+    """Shared signature probe: does ``fn`` accept a ``rich_markdown`` kwarg?"""
     if fn is None:
         return False
     try:
@@ -6895,7 +6919,15 @@ async def _send_card(adapter: Any, event: Any, card: dict[str, Any]) -> None:
             **kb_kwargs,
         )
     else:
-        result = adapter.send(chat_id, card["text"], reply_to=reply_to, metadata=metadata)
+        # Action-LESS cards (status / today / status-proof) carry their rich
+        # payload here. Forward rich_markdown to adapter.send so the
+        # status/today cards actually render rich — but only when the bound
+        # send signature accepts it (same dual-source-skew guard as the
+        # actions path; legacy / non-telegram adapters keep the plain send).
+        send_kwargs: dict[str, Any] = {"reply_to": reply_to, "metadata": metadata}
+        if rich_markdown and _send_accepts_rich(adapter):
+            send_kwargs["rich_markdown"] = rich_markdown
+        result = adapter.send(chat_id, card["text"], **send_kwargs)
     if inspect.isawaitable(result):
         result = await result
     if actions and not getattr(result, "success", True):
