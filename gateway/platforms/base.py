@@ -2516,11 +2516,19 @@ class BasePlatformAdapter(ABC):
         actions: list,
         metadata: Optional[Dict[str, Any]] = None,
         reply_to: Optional[str] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
         """Send a generic KB action card.
 
         Platforms with native buttons override this.  The safe default keeps
         the user-visible content and degrades actions to plain text labels.
+
+        ``rich_markdown`` is an OPTIONAL RAW-markdown rendering of the same
+        card body.  Platforms that support Bot API 10.1 rich messages
+        (Telegram) may deliver the card and its buttons as a single native
+        rich message; the base default ignores it (the legacy ``text`` body is
+        the contract for every other transport), so callers can always pass it
+        unconditionally.
         """
         labels: list[str] = []
         for action in actions or []:

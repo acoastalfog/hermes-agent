@@ -1338,6 +1338,104 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message_id) if message_id is not None else None,
         )
 
+    async def _try_send_rich_actions(
+        self,
+        chat_id: str,
+        content: str,
+        rows: list,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        """Attempt one ``sendRichMessage`` carrying the card body AND buttons.
+
+        Mirrors :meth:`_try_send_rich` (routing, notification, raw link-preview
+        dict, rich_sent_store.record, error contract) but adds a
+        ``reply_markup`` serialized from ``rows`` so a kb_journeys command card
+        and its inline keyboard arrive as a single native rich message.
+
+        Returns a :class:`SendResult` (success, or a transient failure the
+        caller must NOT legacy-resend), or ``None`` to signal "fall back to the
+        legacy MarkdownV2 keyboard send" (permanent/capability error or the
+        DM-topic skip). Callers gate on :meth:`_rich_eligible` first.
+        """
+        thread_id = self._metadata_thread_id(metadata)
+        routing = self._compute_single_send_routing(chat_id, reply_to, metadata, thread_id)
+        if routing is None:
+            return None
+        reply_to_id, thread_kwargs = routing
+
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "rich_message": self._rich_message_payload(content),
+        }
+        payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        payload.update(self._notification_kwargs(metadata))
+        if getattr(self, "_disable_link_previews", False):
+            # Raw {is_disabled: true} dict, NOT _link_preview_kwargs() which can
+            # return a PTB LinkPreviewOptions object (do_api_request api_kwargs
+            # must be plain JSON types).
+            payload["link_preview_options"] = {"is_disabled": True}
+        if reply_to_id is not None:
+            payload["reply_parameters"] = {"message_id": reply_to_id}
+        if rows:
+            # do_api_request api_kwargs takes plain JSON, so serialize the
+            # InlineKeyboardMarkup to a dict rather than passing the PTB object
+            # (which would be silently dropped / fail to serialize).
+            markup = InlineKeyboardMarkup(rows)
+            payload["reply_markup"] = (
+                markup.to_dict() if hasattr(markup, "to_dict") else markup
+            )
+
+        try:
+            msg = await self._bot.do_api_request(
+                "sendRichMessage", api_kwargs=payload
+            )
+        except Exception as exc:
+            if self._is_rich_fallback_error(exc):
+                if self._is_rich_capability_error(exc):
+                    self._rich_send_disabled = True
+                logger.debug(
+                    "[%s] sendRichMessage (actions) rejected (%s) — falling back to MarkdownV2",
+                    self.name, exc,
+                )
+                return None
+            err_str = str(exc).lower()
+            try:
+                from telegram.error import TimedOut as _TimedOut
+            except (ImportError, AttributeError):
+                _TimedOut = None
+            is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
+            is_connect_timeout = self._looks_like_connect_timeout(exc)
+            logger.warning(
+                "[%s] sendRichMessage (actions) transient failure (no legacy resend): %s",
+                self.name, exc,
+            )
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=(is_connect_timeout or not is_timeout),
+            )
+
+        message_id = None
+        if isinstance(msg, dict):
+            message_id = msg.get("message_id")
+            if message_id is None:
+                message_id = (msg.get("result") or {}).get("message_id")
+        else:
+            message_id = getattr(msg, "message_id", None)
+        if message_id is not None:
+            # Telegram won't echo rich content in reply_to_message, so remember
+            # what we sent — replies to this card resolve via this index.
+            try:
+                from gateway import rich_sent_store
+                rich_sent_store.record(str(chat_id), str(message_id), content)
+            except Exception:
+                pass
+        return SendResult(
+            success=True,
+            message_id=str(message_id) if message_id is not None else None,
+        )
+
     async def _try_edit_rich(
         self,
         chat_id: str,
@@ -3423,8 +3521,19 @@ class TelegramAdapter(BasePlatformAdapter):
         actions: list,
         metadata: Optional[Dict[str, Any]] = None,
         reply_to: Optional[str] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
-        """Render a generic KB action card with opaque inline callbacks."""
+        """Render a generic KB action card with opaque inline callbacks.
+
+        When ``rich_markdown`` is supplied and rich delivery is eligible
+        (capability present, rich not latched off, content fits the rich cap,
+        no TDesktop details+math crash shape), the card body AND its inline
+        keyboard are delivered as a single Bot API 10.1 ``sendRichMessage``
+        (the spec permits ``reply_markup`` on that endpoint).  On any
+        capability/BadRequest fallback the call degrades transparently to the
+        existing MarkdownV2 keyboard send below — identical to today when
+        ``rich_markdown`` is None.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -3483,6 +3592,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 rows.append([
                     InlineKeyboardButton(button_label, callback_data=callback_data)
                 ])
+
+            # Bot API 10.1: deliver the card body AND its buttons as a single
+            # native rich message when eligible. The RAW markdown carries
+            # tables/headings/lists that the legacy MarkdownV2 path degrades.
+            # Any capability/permanent rejection returns None and falls through
+            # to the unchanged MarkdownV2 keyboard send below — the registered
+            # callbacks remain valid because the same `rows` keyboard is sent.
+            if rich_markdown and self._rich_eligible(rich_markdown):
+                rich_result = await self._try_send_rich_actions(
+                    chat_id, rich_markdown, rows, reply_to, metadata
+                )
+                if rich_result is not None:
+                    return rich_result
 
             kwargs: Dict[str, Any] = {
                 "chat_id": int(chat_id),
@@ -4474,10 +4596,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 result_text = result
                 result_actions = []
+                result_rich_markdown: Optional[str] = None
                 if isinstance(result, dict):
                     result_text = str(result.get("text") or "")
                     actions_value = result.get("actions")
                     result_actions = actions_value if isinstance(actions_value, list) else []
+                    rich_value = result.get("rich_markdown")
+                    if isinstance(rich_value, str) and rich_value.strip():
+                        result_rich_markdown = rich_value
 
                 if (result_text or result_actions) and query.message:
                     if result_actions:
@@ -4486,6 +4612,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             str(result_text or "KB action"),
                             result_actions,
                             metadata=_kb_callback_send_metadata(),
+                            rich_markdown=result_rich_markdown,
                         )
                         if not getattr(send_result, "success", False) and result_text:
                             logger.warning(

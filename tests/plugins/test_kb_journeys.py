@@ -4259,3 +4259,171 @@ def test_emphasis_headline_does_not_escape():
     from plugins.kb_journeys import _emphasis_headline
 
     assert _emphasis_headline("A_B") == "*A_B*"  # only adds *, no escapes
+
+
+# ---------------------------------------------------------------------------
+# Rich KB command cards (Bot API 10.1 sendRichMessage + inline keyboard).
+#
+# Informational/action cards gain a RAW-markdown ``rich_markdown`` field
+# (separate from the MarkdownV2-escaped ``text``). _send_card forwards it to
+# send_kb_actions only when the bound adapter signature accepts it.
+# ---------------------------------------------------------------------------
+class RichKbActionsAdapter(FakeAdapter):
+    """Adapter whose send_kb_actions accepts the rich_markdown kwarg."""
+
+    async def send_kb_actions(
+        self, chat_id, text, actions, metadata=None, reply_to=None, rich_markdown=None
+    ):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "actions": actions,
+                "metadata": metadata,
+                "reply_to": reply_to,
+                "rich_markdown": rich_markdown,
+            }
+        )
+        return SimpleNamespace(success=True, message_id="1")
+
+
+def _is_raw_not_markdownv2(md: str) -> bool:
+    # Raw markdown keeps a real heading and unescaped table pipes; MarkdownV2
+    # would have escaped '#', '-' and '|' (e.g. '\\#', '\\-', '\\|').
+    return "\\#" not in md and "\\|" not in md and "\\-" not in md
+
+
+def test_rich_kv_table_emits_raw_two_column_table():
+    from plugins.kb_journeys import _rich_kv_table
+
+    md = _rich_kv_table("KB Status", [("Lane", "prod"), ("Readiness", "ready")])
+    assert md.splitlines()[0] == "## KB Status"
+    assert "| Field | Value |" in md
+    assert "| --- | --- |" in md
+    assert "| Lane | prod |" in md
+    assert "| Readiness | ready |" in md
+    assert _is_raw_not_markdownv2(md)
+
+
+def test_rich_cell_neutralizes_pipes_and_newlines():
+    from plugins.kb_journeys import _rich_cell
+
+    # A stray pipe/newline in an MCP value must not split or escape its cell.
+    assert "|" not in _rich_cell("a|b\nc")
+    assert "\n" not in _rich_cell("a|b\nc")
+
+
+def test_render_status_emits_rich_table_alongside_markdownv2_text():
+    from plugins.kb_journeys import _render_status
+
+    card = _render_status({}, target="kb_engine_prod")
+    # Legacy text stays MarkdownV2 (bold via *...*), unchanged contract.
+    assert card["text"].startswith("*KB Status*")
+    # Rich field is RAW markdown with a native table.
+    md = card["rich_markdown"]
+    assert md.splitlines()[0] == "## KB Status"
+    assert "| MCP target | kb_engine_prod |" in md
+    assert _is_raw_not_markdownv2(md)
+
+
+def test_render_status_proof_emits_rich_table_and_keeps_expandable_text():
+    from plugins.kb_journeys import _render_status
+
+    packet = {"kind": "kb_status_proof_packet", "status": "ready"}
+    card = _render_status(packet, target="kb_engine_prod")
+    # Legacy text keeps the expandable blockquote contract.
+    assert "**>" in card["text"]
+    md = card["rich_markdown"]
+    assert "## KB Status" in md
+    assert "| Outcome | ready |" in md
+    assert "Commands: /kb sync" in md
+    assert _is_raw_not_markdownv2(md)
+
+
+def test_render_today_emits_rich_table_and_bullet_lists():
+    from plugins.kb_journeys import _render_today
+
+    data = {
+        "summary": {"proposal_queue_count": 2},
+        "runs": {"active": [{"title": "sync", "status": "running"}]},
+        "next_actions": [{"title": "review queue"}],
+    }
+    card = _render_today(data)
+    md = card["rich_markdown"]
+    assert "## KB Today" in md
+    assert "| Readiness |" in md
+    assert "## Runs" in md
+    assert "## Next" in md
+    assert "- review queue" in md
+    assert _is_raw_not_markdownv2(md)
+
+
+def test_render_dashboard_emits_rich_field_and_keeps_actions():
+    from plugins.kb_journeys import _render_dashboard
+
+    data = {
+        "summary": {"readiness_status": "ready", "publication_status": "clean"},
+        "sections": [
+            {"id": "review", "title": "Review", "cards": [{"title": "proposal-1", "detail": "open"}]}
+        ],
+        "next_actions": ["publish"],
+    }
+    card = _render_dashboard(data, ctx=None, target="kb_engine_prod")
+    md = card["rich_markdown"]
+    assert md.splitlines()[0] == "## KB"
+    assert "| Runtime | ready |" in md
+    assert "- proposal-1 — open" in md
+    assert "Commands: /kb status" in md
+    assert _is_raw_not_markdownv2(md)
+    # Dashboard keeps its descriptor actions (buttons ride in the SAME rich msg).
+    assert isinstance(card["actions"], list)
+
+
+def test_send_card_forwards_rich_markdown_when_adapter_accepts_it():
+    from plugins.kb_journeys import _send_card
+    from tools.kb_callback_registry import KbAction
+
+    adapter = RichKbActionsAdapter()
+    asyncio.run(
+        _send_card(
+            adapter,
+            _event("/kb"),
+            {
+                "title": "KB",
+                "text": "*KB*\nstatus",
+                "rich_markdown": "## KB\n\n| Field | Value |\n| --- | --- |\n| Runtime | ready |",
+                "actions": [KbAction(label="Open", action_id="open", handler=lambda _ctx: None)],
+            },
+        )
+    )
+    assert len(adapter.sent) == 1
+    sent = adapter.sent[0]
+    assert sent["rich_markdown"].startswith("## KB")
+    # The legacy text body is still MarkdownV2 (separate field, opposite escaping).
+    assert sent["text"] == "*KB*\nstatus"
+
+
+def test_send_card_skips_rich_markdown_for_legacy_adapter_signature():
+    """Dual-source skew guard: an older adapter signature lacks rich_markdown,
+    so _send_card must NOT forward it (would TypeError)."""
+    from plugins.kb_journeys import _send_card
+    from tools.kb_callback_registry import KbAction
+
+    # FakeKbActionsAdapter.send_kb_actions has NO rich_markdown param.
+    adapter = FakeKbActionsAdapter()
+    asyncio.run(
+        _send_card(
+            adapter,
+            _event("/kb"),
+            {
+                "title": "KB",
+                "text": "*KB*\nstatus",
+                "rich_markdown": "## KB\n\n| Field | Value |\n| --- | --- |",
+                "actions": [KbAction(label="Open", action_id="open", handler=lambda _ctx: None)],
+            },
+        )
+    )
+    # The card was still delivered via the legacy text/actions path (no crash).
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"] == "*KB*\nstatus"
+    assert "rich_markdown" not in adapter.sent[0]
