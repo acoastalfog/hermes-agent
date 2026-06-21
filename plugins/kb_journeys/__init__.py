@@ -265,6 +265,42 @@ def _clip(value: Any, limit: int = 220) -> str:
     return text[: max(0, limit - 1)].rstrip() + "..."
 
 
+_EXPANDABLE_MIN_LINES = 3  # only collapse genuinely long bodies
+
+
+def _expandable_block(text: str) -> str:
+    """Wrap a multi-line body in a Telegram EXPANDABLE blockquote.
+
+    telegram.py _convert_blockquote regex is r'^((?:\\*\\*)?>{1,3}) (.+)$'
+    (a SPACE is required after the '>'/'**>' prefix). The expandable variant
+    fires when a matched line has a '**>' prefix AND content ending in '||'.
+    We therefore emit:  '**> <first>||'  then  '> <line>' continuations.
+    Short bodies pass through unchanged. PLUGIN-DATA-SHAPE-ONLY: no fork-core
+    edit; format_message already understands this marker.
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    if len(lines) < _EXPANDABLE_MIN_LINES:
+        return text
+    first, *rest = lines
+    head = f"**> {first}||"           # space after **> ; || marks expandable on this matched line
+    tail = [f"> {ln}" for ln in rest]  # space after > on every continuation line
+    return "\n".join([head, *tail])
+
+
+def _emphasis_headline(label: str) -> str:
+    """Bold a card headline in MarkdownV2. PLUGIN-DATA-SHAPE-ONLY.
+
+    Assumes ``label`` is plain headline text that the caller's text assembly
+    will escape via format_message; we only add the '*' emphasis markers and
+    add NO escapes (caller owns escaping). Only bold short, control-char-free
+    headline labels (no interpolated user/MCP free-text).
+    """
+    label = (label or "").strip()
+    return f"*{label}*" if label else label
+
+
 def _request_receipt(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -1840,7 +1876,7 @@ def _public_error(errors: list[str]) -> str:
 
 def _render_error(title: str, target: str, errors: list[str]) -> dict[str, Any]:
     detail = _public_error(errors)
-    text = f"{title}\nMCP target: {target}\nKB data is not available yet.\n{detail}"
+    text = f"{_emphasis_headline(title)}\nMCP target: {target}\nKB data is not available yet.\n{detail}"
     return {"title": title, "text": text, "actions": []}
 
 
@@ -1895,7 +1931,11 @@ def _render_today(data: Any) -> dict[str, Any]:
 
 def _render_dashboard(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
     if not isinstance(data, dict):
-        return {"title": "KB", "text": f"KB\n{_short(data, 'No KB details returned.')}", "actions": []}
+        return {
+            "title": "KB",
+            "text": f"{_emphasis_headline('KB')}\n{_short(data, 'No KB details returned.')}",
+            "actions": [],
+        }
 
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
     readiness = _short(
@@ -1915,7 +1955,7 @@ def _render_dashboard(data: Any, *, ctx: Any, target: str) -> dict[str, Any]:
         todo_count = _count_from(data, "todo", "todos")
     active_runs = summary.get("active_run_count")
     lines = [
-        "KB",
+        _emphasis_headline("KB"),
         f"kb status: runtime {readiness} · publication {publication}",
     ]
     if data.get("llm_invoked_by_read_surface") is not None:
@@ -2763,7 +2803,7 @@ def _render_status(
         readiness = _short(_readiness_status(data))
         publication = _short(_publication_status(data))
     lines = [
-        "KB Status",
+        _emphasis_headline("KB Status"),
         f"Lane: {snap['lane']}",
         f"Environment: {snap['environment']}",
         f"MCP target: {target}",
@@ -2876,8 +2916,7 @@ def _render_status_proof(
     privacy = packet.get("privacy") if isinstance(packet.get("privacy"), dict) else {}
     privacy_ok = not any(bool(value) for value in privacy.values())
     next_action = _next_action_summary(packet)
-    lines = [
-        "KB Status",
+    detail_lines = [
         "Request: /kb status",
         f"Outcome: {status}",
         f"Lane: {lane}",
@@ -2893,9 +2932,18 @@ def _render_status_proof(
         f"Hermes reasoning: {snap['reasoning']}",
     ]
     if next_action:
-        lines.append(f"Next: {next_action}")
-    lines.append("Commands: /kb sync · /kb review")
-    return {"title": "KB Status", "text": "\n".join(lines), "actions": []}
+        detail_lines.append(f"Next: {next_action}")
+    # Phase B pilot: bold headline (Task 2) + collapse the long status detail body
+    # into an expandable blockquote (Task 1). The Commands hint stays outside the
+    # block so the primary action remains immediately visible. PLUGIN-DATA-SHAPE-ONLY.
+    text = "\n".join(
+        [
+            _emphasis_headline("KB Status"),
+            _expandable_block("\n".join(detail_lines)),
+            "Commands: /kb sync · /kb review",
+        ]
+    )
+    return {"title": "KB Status", "text": text, "actions": []}
 
 
 def _render_runs(data: Any) -> dict[str, Any]:

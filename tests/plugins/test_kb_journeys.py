@@ -4216,3 +4216,46 @@ def test_kb_reasoning_sets_env_and_reloads_mcp(monkeypatch, tmp_path):
     assert "KB reasoning set to xhigh" in adapter.sent[0]["text"]
     assert "MCP reload started" in adapter.sent[0]["text"]
     assert "MCP Reload" in adapter.sent[1]["text"]
+
+
+# --- kb_journeys card enrichment parity (mirrors hermes-kb-journeys user-plugin) ---
+# telegram.py _convert_blockquote regex: a SPACE is required after the '>'/'**>'
+# prefix; the expandable variant fires when the first matched line has a '**>'
+# prefix AND content ending in '||'.
+_TELEGRAM_BLOCKQUOTE_RE = __import__("re").compile(r"^((?:\*\*)?>{1,3}) (.+)$")
+
+
+def test_expandable_block_matches_telegram_blockquote_regex():
+    from plugins.kb_journeys import _expandable_block
+
+    body = "line one\nline two\nline three"
+    out = _expandable_block(body)
+    out_lines = out.splitlines()
+    first = _TELEGRAM_BLOCKQUOTE_RE.match(out_lines[0])
+    assert first is not None, f"first line does not match blockquote regex: {out_lines[0]!r}"
+    assert first.group(1).startswith("**"), "first line must be expandable (**> prefix)"
+    assert first.group(2).endswith("||"), "first matched line content must end with || to be expandable"
+    # Every line must ALSO match the regex (space after '>') so it renders as a
+    # quote, not literal text.
+    for ln in out_lines:
+        assert _TELEGRAM_BLOCKQUOTE_RE.match(ln) is not None, f"line does not match: {ln!r}"
+    assert "line one" in out and "line three" in out
+
+
+def test_expandable_block_passthrough_for_short_body():
+    from plugins.kb_journeys import _expandable_block
+
+    assert _expandable_block("ok") == "ok"
+    assert _expandable_block("one\ntwo") == "one\ntwo"  # 2 lines < min
+
+
+def test_emphasis_headline_bolds_and_preserves_text():
+    from plugins.kb_journeys import _emphasis_headline
+
+    assert _emphasis_headline("KB Status") == "*KB Status*"  # MarkdownV2 bold
+
+
+def test_emphasis_headline_does_not_escape():
+    from plugins.kb_journeys import _emphasis_headline
+
+    assert _emphasis_headline("A_B") == "*A_B*"  # only adds *, no escapes
