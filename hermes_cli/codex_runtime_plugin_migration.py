@@ -642,17 +642,7 @@ def migrate(
             codex doesn't have built in. Set False to opt out.
     """
     report = MigrationReport(dry_run=dry_run)
-    # Honor $CODEX_HOME (codex's own config-location env) when no explicit
-    # override is passed. Root-cause fix for #26250: callers like
-    # codex_runtime_switch.apply() invoke migrate(config) with no codex_home,
-    # which previously hardcoded the real ~/.codex even when a test (or a
-    # spawned-codex launcher) had pointed CODEX_HOME elsewhere — leaking
-    # transient paths into the user's real config. Respecting CODEX_HOME makes
-    # the write target isolatable by construction and matches where codex
-    # itself looks for config.toml.
-    if codex_home is None:
-        _env_home = os.environ.get("CODEX_HOME")
-        codex_home = Path(_env_home).expanduser() if _env_home else Path.home() / ".codex"
+    codex_home = codex_home or Path.home() / ".codex"
     target = codex_home / "config.toml"
     report.target_path = target
 
