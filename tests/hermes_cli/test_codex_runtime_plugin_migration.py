@@ -220,6 +220,22 @@ class TestTomlValueFormatter:
                     if p.name.startswith(".config.toml.")]
         assert leftover == [], f"temp files leaked: {leftover}"
 
+    def test_migrate_honors_codex_home_env(self, tmp_path, monkeypatch):
+        """Root-cause guard for #26250: with no explicit codex_home, migrate()
+        must target $CODEX_HOME (codex's own config-location env), never the
+        real ~/.codex. This isolates every caller (e.g. codex_runtime_switch's
+        enable path, which calls migrate(config) with no codex_home) under test
+        and for spawned-codex launchers that set a custom CODEX_HOME."""
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        report = migrate(
+            {"mcp_servers": {"x": {"command": "y"}}},
+            discover_plugins=False,
+            expose_hermes_tools=False,
+            default_permission_profile=None,
+        )
+        assert report.target_path == tmp_path / "config.toml"
+        assert (tmp_path / "config.toml").exists()
+
     def test_unsupported_type_raises(self):
         with pytest.raises(ValueError):
             _format_toml_value(object())
