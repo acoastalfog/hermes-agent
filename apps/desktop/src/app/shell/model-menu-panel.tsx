@@ -18,7 +18,13 @@ import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { currentPickerSelection, displayModelName, modelDisplayParts, reasoningEffortLabel } from '@/lib/model-status-label'
+import { resolveModelReasoningPolicy } from '@/lib/model-picker-policy'
+import {
+  currentPickerSelection,
+  displayModelName,
+  modelDisplayParts,
+  reasoningEffortLabel
+} from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { $modelPresets, applyModelPreset, modelPresetKey } from '@/store/model-presets'
 import {
@@ -150,6 +156,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
     const caps = provider.capabilities?.[family.id]
     const preset = modelPresets[modelPresetKey(provider.slug, family.id)] ?? {}
 
+    const reasoningPolicy = resolveModelReasoningPolicy(caps, {
+      currentEffort: '',
+      isCurrent: false,
+      presetEffort: preset.effort
+    })
+
     // Variant-fast models (no speed param) express "fast" as a separate `-fast`
     // id, so honor the saved preset by selecting that sibling. Param-fast is
     // applied via applyModelPreset below instead.
@@ -162,7 +174,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
 
     await applyModelPreset(
       {
-        effort: (caps?.reasoning ?? true) ? (preset.effort ?? 'medium') : undefined,
+        effort: reasoningPolicy.configurable ? reasoningPolicy.effort : undefined,
         fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
       },
       { failMessage: t.shell.modelOptions.updateFailed, request: requestGateway, sessionId: activeSessionId }
@@ -170,18 +182,14 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
   }
 
   const groups = useMemo(
-    () => groupModels(providers ?? [], search, { model: optionsModel, provider: optionsProvider }, effectiveVisibleModels),
+    () =>
+      groupModels(providers ?? [], search, { model: optionsModel, provider: optionsProvider }, effectiveVisibleModels),
     [providers, search, optionsModel, optionsProvider, effectiveVisibleModels]
   )
 
   return (
     <>
-      <DropdownMenuSearch
-        aria-label={copy.search}
-        onValueChange={setSearch}
-        placeholder={copy.search}
-        value={search}
-      />
+      <DropdownMenuSearch aria-label={copy.search} onValueChange={setSearch} placeholder={copy.search} value={search} />
 
       <DropdownMenuSeparator className="mx-0" />
 
@@ -221,18 +229,25 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                     : null
 
                 const isCurrent = activeId !== null
-                const name = modelDisplayParts(family.id).name
                 // Capabilities are looked up against the active/base id; the
                 // -fast variant carries the same param support as its base.
                 const caps = group.provider.capabilities?.[family.id]
+                const name = caps?.display_name?.trim() || modelDisplayParts(family.id).name
 
                 // Effective settings for this row: live session state when it's
                 // the active model, otherwise its remembered preset (Hermes
                 // defaults when unset). Row label AND submenu read from these so
                 // they never disagree.
                 const preset = modelPresets[modelPresetKey(group.provider.slug, family.id)] ?? {}
-                const effEffort = isCurrent ? currentReasoningEffort : preset.effort ?? ''
-                const effFast = isCurrent ? currentFastMode : preset.fast ?? false
+
+                const reasoningPolicy = resolveModelReasoningPolicy(caps, {
+                  currentEffort: currentReasoningEffort,
+                  isCurrent,
+                  presetEffort: preset.effort
+                })
+
+                const effEffort = reasoningPolicy.effort
+                const effFast = isCurrent ? currentFastMode : (preset.fast ?? false)
 
                 const fastControl = resolveFastControl(
                   activeId ?? family.id,
@@ -243,10 +258,15 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
 
                 const meta = [
                   fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
-                  (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort) || copy.medium : null
+                  reasoningPolicy.configurable
+                    ? reasoningEffortLabel(effEffort) || copy.medium
+                    : reasoningPolicy.label ||
+                      ((caps?.reasoning ?? true) ? reasoningEffortLabel(reasoningPolicy.defaultEffort) : null)
                 ]
                   .filter(Boolean)
                   .join(' ')
+
+                const hasOptions = fastControl.kind !== 'none' || reasoningPolicy.configurable
 
                 // Every row is a hover-Edit submenu trigger. Activating it
                 // (pointer or keyboard) switches to the family's base model and
@@ -264,6 +284,28 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                   closeMenu()
                 }
 
+                const rowContent = (
+                  <>
+                    <span className="min-w-0 flex-1 truncate">
+                      {name}
+                      {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
+                    </span>
+                    {isCurrent ? <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" /> : null}
+                  </>
+                )
+
+                if (!hasOptions) {
+                  return (
+                    <DropdownMenuItem
+                      className={dropdownMenuRow}
+                      key={`${group.provider.slug}:${family.id}`}
+                      onSelect={activate}
+                    >
+                      {rowContent}
+                    </DropdownMenuItem>
+                  )
+                }
+
                 return (
                   <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                     <DropdownMenuSubTrigger
@@ -276,11 +318,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                         }
                       }}
                     >
-                      <span className="min-w-0 flex-1 truncate">
-                        {name}
-                        {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
-                      </span>
-                      {isCurrent ? <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" /> : null}
+                      {rowContent}
                     </DropdownMenuSubTrigger>
                     <ModelEditSubmenu
                       effort={effEffort}
@@ -289,7 +327,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                       model={family.id}
                       onSelectModel={nextModel => switchTo(nextModel, group.provider.slug)}
                       provider={group.provider.slug}
-                      reasoning={caps?.reasoning ?? true}
+                      reasoning={reasoningPolicy.configurable}
                       requestGateway={requestGateway}
                     />
                   </DropdownMenuSub>
