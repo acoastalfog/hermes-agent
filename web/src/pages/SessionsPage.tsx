@@ -31,6 +31,10 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
+import {
+  sessionModelLabel,
+  sessionSourceLabel,
+} from "@/lib/session-display";
 import type {
   SessionInfo,
   SessionMessage,
@@ -430,7 +434,7 @@ function SessionRow({
   const actionButtons = (
     <>
       <Badge tone="outline" className="text-xs">
-        {session.source ?? "local"}
+        {sessionSourceLabel(session.source)}
       </Badge>
 
       {resumeInChatEnabled && (
@@ -606,7 +610,7 @@ function SessionRow({
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="max-w-[min(100%,12rem)] truncate sm:max-w-[180px]">
-                  {(session.model ?? t.common.unknown).split("/").pop()}
+                  {sessionModelLabel(session.model)}
                 </span>
                 <span className="text-border">&#183;</span>
                 <span className="shrink-0">
@@ -1683,7 +1687,7 @@ export default function SessionsPage() {
 
                       <span className="min-w-0 break-words text-xs text-muted-foreground">
                         <span className="font-mono-ui">
-                          {(s.model ?? t.common.unknown).split("/").pop()}
+                          {sessionModelLabel(s.model)}
                         </span>{" "}
                         · {s.message_count} {t.common.msgs} ·{" "}
                         {timeAgo(s.last_active)}
@@ -1701,7 +1705,7 @@ export default function SessionsPage() {
                       className="shrink-0 self-start text-xs sm:self-center"
                     >
                       <Database className="mr-1 h-3 w-3" />
-                      {s.source ?? "local"}
+                      {sessionSourceLabel(s.source)}
                     </Badge>
                   </div>
                 ))}
