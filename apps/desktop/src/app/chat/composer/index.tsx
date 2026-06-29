@@ -184,6 +184,8 @@ export function ChatBar({
   queueSessionKey,
   sessionId,
   state,
+  submitBlockedReason,
+  submitDisabled = false,
   onCancel,
   onAddUrl,
   onAttachDroppedItems,
@@ -347,6 +349,7 @@ export function ChatBar({
   const followUpPlaceholders = t.composer.followUpPlaceholders
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
   const inputDisabled = disabled && !reconnecting
+  const submissionDisabled = disabled || submitDisabled
 
   // Resting placeholder: a starter for brand-new sessions, a continuation for
   // existing ones. Picked once and only re-rolled when we genuinely move to a
@@ -1187,7 +1190,7 @@ export function ChatBar({
       const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
       const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
 
-      if (disabled) {
+      if (submissionDisabled) {
         return
       }
 
@@ -1865,7 +1868,7 @@ export function ChatBar({
   )
 
   const submitDraft = () => {
-    if (disabled) {
+    if (submissionDisabled) {
       return
     }
 
@@ -2061,6 +2064,7 @@ export function ChatBar({
       onDictate={dictate}
       onSteer={steerDraft}
       state={state}
+      submitDisabled={submitDisabled}
       voiceStatus={voiceStatus}
     />
   )
@@ -2200,6 +2204,15 @@ export function ChatBar({
           }
         >
           {showHelpHint && <HelpHint />}
+          {!disabled && submitDisabled && submitBlockedReason && (
+            <div
+              className="mb-1 truncate px-3 text-[0.6875rem] text-destructive"
+              role="status"
+              title={submitBlockedReason}
+            >
+              {submitBlockedReason}
+            </div>
+          )}
           {trigger && !argStageEmpty && (
             <ComposerTriggerPopover
               activeIndex={triggerActive}

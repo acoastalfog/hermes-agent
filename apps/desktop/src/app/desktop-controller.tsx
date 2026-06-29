@@ -612,7 +612,7 @@ export function DesktopController() {
     refreshProjectBranch
   })
 
-  const { refreshCurrentModel, selectModel, updateModelOptionsCache } = useModelControls({
+  const { modelReadbackError, refreshCurrentModel, selectModel, updateModelOptionsCache } = useModelControls({
     activeSessionId,
     queryClient,
     requestGateway
@@ -1189,8 +1189,10 @@ export function DesktopController() {
   const chatView = (
     <ChatView
       gateway={gatewayRef.current}
+      inferenceStatus={inferenceStatus}
       maxVoiceRecordingSeconds={voiceMaxRecordingSeconds}
       modelMenuContent={modelMenuContent}
+      modelReadbackError={modelReadbackError}
       onAddContextRef={composer.addContextRefAttachment}
       onAddUrl={url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url)}
       onAttachDroppedItems={composer.attachDroppedItems}

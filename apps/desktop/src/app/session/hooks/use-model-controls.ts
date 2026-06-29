@@ -1,5 +1,5 @@
 import { type QueryClient } from '@tanstack/react-query'
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -21,6 +21,7 @@ interface ModelControlsOptions {
 export function useModelControls({ activeSessionId, queryClient, requestGateway }: ModelControlsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const [modelReadbackError, setModelReadbackError] = useState<string | null>(null)
 
   const updateModelOptionsCache = useCallback(
     (provider: string, model: string, includeGlobal: boolean) => {
@@ -43,13 +44,18 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
   const refreshCurrentModel = useCallback(async (force = false) => {
     try {
       if ($activeSessionId.get()) {
+        setModelReadbackError(null)
+
         return
       }
 
       if (!force && $currentModel.get()) {
+        setModelReadbackError(null)
+
         return
       }
 
+      setModelReadbackError(null)
       const result = await getGlobalModelInfo()
 
       if ($activeSessionId.get() || (!force && $currentModel.get())) {
@@ -57,14 +63,25 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       }
 
       if (typeof result.model === 'string') {
-        setCurrentModel(result.model)
+        const model = result.model.trim()
+
+        if (model) {
+          setCurrentModel(model)
+          setModelReadbackError(null)
+        } else {
+          setModelReadbackError('Gateway did not report a configured model.')
+        }
+      } else {
+        setModelReadbackError('Gateway did not report a configured model.')
       }
 
       if (typeof result.provider === 'string') {
         setCurrentProvider(result.provider)
       }
-    } catch {
-      // The delayed session.info event still updates this once the agent is ready.
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+
+      setModelReadbackError(`Configured model readback failed: ${detail}`)
     }
   }, [])
 
@@ -89,6 +106,8 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.
       if (!activeSessionId) {
+        setModelReadbackError(null)
+
         return true
       }
 
@@ -114,5 +133,10 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
     [activeSessionId, copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
   )
 
-  return { refreshCurrentModel, selectModel, updateModelOptionsCache }
+  return {
+    modelReadbackError,
+    refreshCurrentModel,
+    selectModel,
+    updateModelOptionsCache
+  }
 }

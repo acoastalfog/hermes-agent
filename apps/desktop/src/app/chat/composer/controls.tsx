@@ -48,6 +48,7 @@ export function ComposerControls({
   disabled,
   hasComposerPayload,
   state,
+  submitDisabled,
   voiceStatus,
   onDictate,
   onSteer
@@ -61,6 +62,7 @@ export function ComposerControls({
   disabled: boolean
   hasComposerPayload: boolean
   state: ChatBarState
+  submitDisabled?: boolean
   voiceStatus: VoiceStatus
   onDictate: () => void
   onSteer: () => void
@@ -110,7 +112,7 @@ export function ComposerControls({
           <Button
             aria-label={c.startVoice}
             className={PRIMARY_ICON_BTN}
-            disabled={disabled}
+            disabled={disabled || submitDisabled}
             onClick={() => {
               triggerHaptic('open')
               conversation.onStart()
@@ -126,7 +128,7 @@ export function ComposerControls({
           <Button
             aria-label={busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}
             className={PRIMARY_ICON_BTN}
-            disabled={disabled || !canSubmit}
+            disabled={disabled || (!busy && submitDisabled) || !canSubmit}
             type="submit"
           >
             {busy ? (
