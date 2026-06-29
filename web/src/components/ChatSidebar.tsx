@@ -34,6 +34,10 @@ import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
+import {
+  chatControlStateLabel,
+  configuredModelLabel,
+} from "@/lib/session-display";
 
 import { cn } from "@/lib/utils";
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
@@ -52,14 +56,6 @@ interface RpcEnvelope {
 }
 
 const TOOL_LIMIT = 20;
-
-const STATE_LABEL: Record<ConnectionState, string> = {
-  idle: "idle",
-  connecting: "connecting",
-  open: "live",
-  closed: "closed",
-  error: "error",
-};
 
 const STATE_TONE: Record<
   ConnectionState,
@@ -375,8 +371,8 @@ export function ChatSidebar({
 
   // The picker writes config.yaml over REST and reloads — it doesn't ride the
   // sidecar gateway session, so it's available whenever the sidebar is mounted.
-  const modelName = effectiveModel || info.model || "—";
-  const modelLabel = modelName.split("/").slice(-1)[0] ?? "—";
+  const modelName = effectiveModel || info.model || "";
+  const modelLabel = configuredModelLabel(modelName);
   const banner = error ?? info.credential_warning ?? null;
 
   return (
@@ -401,7 +397,7 @@ export function ChatSidebar({
               "self-start normal-case tracking-normal text-sm font-medium",
               "hover:underline disabled:no-underline",
             )}
-            title={modelName === "—" ? "switch model" : modelName}
+            title={modelName ? modelName : "model readiness was not observed"}
           >
             <span className="flex min-w-0 max-w-full items-center gap-1">
               <span className="truncate">{modelLabel}</span>
@@ -412,7 +408,7 @@ export function ChatSidebar({
         </div>
 
         <Badge tone={STATE_TONE[state]} className="shrink-0">
-          {STATE_LABEL[state]}
+          {chatControlStateLabel(state)}
         </Badge>
       </Card>
 
