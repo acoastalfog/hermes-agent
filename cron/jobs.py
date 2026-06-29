@@ -626,6 +626,8 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    silent_ok: bool = True,
+    require_tool_call: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -670,6 +672,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        silent_ok: When False, ``[SILENT]`` responses are treated as watcher
+                failures and delivered instead of suppressed.
+        require_tool_call: When True, an LLM-driven cron job must call at least
+                one tool before it can complete successfully. Use this for
+                watchdogs that must query live state.
 
     Returns:
         The created job dict
@@ -704,6 +711,8 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_silent_ok = bool(silent_ok)
+    normalized_require_tool_call = bool(require_tool_call)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -735,6 +744,8 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "silent_ok": normalized_silent_ok,
+        "require_tool_call": normalized_require_tool_call,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),

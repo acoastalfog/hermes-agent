@@ -531,6 +531,73 @@ class TelegramAdapter(BasePlatformAdapter):
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
 
+    async def refresh_skill_group(self) -> tuple[int, int]:
+        """Refresh Telegram's BotCommand menu after a skill reload.
+
+        ``/reload-skills`` already refreshes Hermes' in-process skill command
+        map. Telegram also caches the slash-command hint menu through
+        ``set_my_commands()``, so re-register it here; otherwise a newly
+        projected shared skill can be typed manually but remain absent from
+        Telegram autocomplete until the next reconnect.
+
+        Returns ``(registered_count, hidden_skill_count)``.
+        """
+        if not self._bot:
+            return (0, 0)
+        try:
+            from telegram import (
+                BotCommand,
+                BotCommandScopeAllGroupChats,
+                BotCommandScopeAllPrivateChats,
+                BotCommandScopeDefault,
+            )
+            from hermes_cli.commands import telegram_menu_commands
+
+            menu_commands, hidden_count = telegram_menu_commands(
+                max_commands=MAX_COMMANDS_PER_SCOPE
+            )
+            bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+            for scope_cls in (
+                BotCommandScopeDefault,
+                BotCommandScopeAllPrivateChats,
+                BotCommandScopeAllGroupChats,
+            ):
+                scope_name = getattr(scope_cls, "__name__", str(scope_cls))
+                try:
+                    await self._bot.set_my_commands(bot_commands, scope=scope_cls())
+                    logger.info(
+                        "[%s] set_my_commands OK for scope %s (%d cmds)",
+                        self.name,
+                        scope_name,
+                        len(bot_commands),
+                    )
+                except Exception as scope_err:
+                    logger.warning(
+                        "[%s] set_my_commands FAILED for scope %s: %s",
+                        self.name,
+                        scope_name,
+                        scope_err,
+                    )
+            if hidden_count:
+                logger.info(
+                    "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
+                    self.name, len(menu_commands), hidden_count, MAX_COMMANDS_PER_SCOPE,
+                )
+            else:
+                logger.info(
+                    "[%s] Telegram menu: %d commands registered.",
+                    self.name, len(menu_commands),
+                )
+            return (len(menu_commands), hidden_count)
+        except Exception as e:
+            logger.warning(
+                "[%s] Could not register Telegram command menu: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return (0, 0)
+
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -1261,6 +1328,104 @@ class TelegramAdapter(BasePlatformAdapter):
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
+            try:
+                from gateway import rich_sent_store
+                rich_sent_store.record(str(chat_id), str(message_id), content)
+            except Exception:
+                pass
+        return SendResult(
+            success=True,
+            message_id=str(message_id) if message_id is not None else None,
+        )
+
+    async def _try_send_rich_actions(
+        self,
+        chat_id: str,
+        content: str,
+        rows: list,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        """Attempt one ``sendRichMessage`` carrying the card body AND buttons.
+
+        Mirrors :meth:`_try_send_rich` (routing, notification, raw link-preview
+        dict, rich_sent_store.record, error contract) but adds a
+        ``reply_markup`` serialized from ``rows`` so a kb_journeys command card
+        and its inline keyboard arrive as a single native rich message.
+
+        Returns a :class:`SendResult` (success, or a transient failure the
+        caller must NOT legacy-resend), or ``None`` to signal "fall back to the
+        legacy MarkdownV2 keyboard send" (permanent/capability error or the
+        DM-topic skip). Callers gate on :meth:`_rich_eligible` first.
+        """
+        thread_id = self._metadata_thread_id(metadata)
+        routing = self._compute_single_send_routing(chat_id, reply_to, metadata, thread_id)
+        if routing is None:
+            return None
+        reply_to_id, thread_kwargs = routing
+
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "rich_message": self._rich_message_payload(content),
+        }
+        payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        payload.update(self._notification_kwargs(metadata))
+        if getattr(self, "_disable_link_previews", False):
+            # Raw {is_disabled: true} dict, NOT _link_preview_kwargs() which can
+            # return a PTB LinkPreviewOptions object (do_api_request api_kwargs
+            # must be plain JSON types).
+            payload["link_preview_options"] = {"is_disabled": True}
+        if reply_to_id is not None:
+            payload["reply_parameters"] = {"message_id": reply_to_id}
+        if rows:
+            # do_api_request api_kwargs takes plain JSON, so serialize the
+            # InlineKeyboardMarkup to a dict rather than passing the PTB object
+            # (which would be silently dropped / fail to serialize).
+            markup = InlineKeyboardMarkup(rows)
+            payload["reply_markup"] = (
+                markup.to_dict() if hasattr(markup, "to_dict") else markup
+            )
+
+        try:
+            msg = await self._bot.do_api_request(
+                "sendRichMessage", api_kwargs=payload
+            )
+        except Exception as exc:
+            if self._is_rich_fallback_error(exc):
+                if self._is_rich_capability_error(exc):
+                    self._rich_send_disabled = True
+                logger.debug(
+                    "[%s] sendRichMessage (actions) rejected (%s) — falling back to MarkdownV2",
+                    self.name, exc,
+                )
+                return None
+            err_str = str(exc).lower()
+            try:
+                from telegram.error import TimedOut as _TimedOut
+            except (ImportError, AttributeError):
+                _TimedOut = None
+            is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
+            is_connect_timeout = self._looks_like_connect_timeout(exc)
+            logger.warning(
+                "[%s] sendRichMessage (actions) transient failure (no legacy resend): %s",
+                self.name, exc,
+            )
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=(is_connect_timeout or not is_timeout),
+            )
+
+        message_id = None
+        if isinstance(msg, dict):
+            message_id = msg.get("message_id")
+            if message_id is None:
+                message_id = (msg.get("result") or {}).get("message_id")
+        else:
+            message_id = getattr(msg, "message_id", None)
+        if message_id is not None:
+            # Telegram won't echo rich content in reply_to_message, so remember
+            # what we sent — replies to this card resolve via this index.
             try:
                 from gateway import rich_sent_store
                 rich_sent_store.record(str(chat_id), str(message_id), content)
@@ -2215,48 +2380,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     error_callback=_polling_error_callback,
                 )
             
-            # Register bot commands so Telegram shows a hint menu when users type /
-            # List is derived from the central COMMAND_REGISTRY — adding a new
-            # gateway command there automatically adds it to the Telegram menu.
-            try:
-                from telegram import (
-                    BotCommand,
-                    BotCommandScopeAllPrivateChats,
-                    BotCommandScopeAllGroupChats,
-                    BotCommandScopeDefault,
-                )
-                from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                # Register for all scopes independently — Telegram picks the
-                # narrowest matching scope per chat type (forum topics fall
-                # through to AllGroupChats or Default).
-                for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
-                    scope_name = scope_cls.__name__
-                    try:
-                        await self._bot.set_my_commands(bot_commands, scope=scope_cls())
-                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
-                    except Exception as scope_err:
-                        logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
-                # Forum topics don't inherit AllGroupChats — Telegram resolves
-                # commands via BotCommandScopeChat(chat_id) for forum groups.
-                # Lazy registration happens in _ensure_forum_commands on first
-                # message from a forum topic (see _handle_text_message).
-                if hidden_count:
-                    logger.info(
-                        "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count, 30,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "[%s] Could not register Telegram command menu: %s",
-                    self.name,
-                    e,
-                    exc_info=True,
-                )
+            await self.refresh_skill_group()
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
@@ -2386,9 +2510,22 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        ``rich_markdown`` is an OPTIONAL RAW-markdown rendering of the same body
+        (separate from the MarkdownV2-escaped ``content``). When supplied and
+        rich delivery is eligible (capability present, rich not latched off,
+        content fits the rich cap, no TDesktop details+math crash shape), it is
+        delivered as a single Bot API 10.1 ``sendRichMessage`` so tables /
+        section headings / bullet lists render natively. This is what makes the
+        action-LESS kb_journeys cards (status / today / status-proof) render
+        rich. On any capability/BadRequest/oversize rejection the send degrades
+        transparently to the MarkdownV2 ``content`` path below — identical to
+        today when ``rich_markdown`` is None.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -2399,8 +2536,31 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
+            # Action-LESS rich card fast-path: when the caller supplied a
+            # separate RAW-markdown payload (the kb_journeys status/today
+            # cards), deliver THAT via sendRichMessage while the MarkdownV2
+            # ``content`` stays the fallback. Mirrors the legacy content
+            # fast-path below but sources the rich body from rich_markdown.
+            # Gated by the same expect_edits + eligibility checks; any
+            # capability/permanent rejection returns None and falls through to
+            # the MarkdownV2 ``content`` send. A transient failure is returned
+            # directly (must NOT be legacy-resent).
+            if (
+                rich_markdown
+                and not (metadata or {}).get("expect_edits")
+                and self._rich_eligible(rich_markdown)
+            ):
+                rich_result = await self._try_send_rich(chat_id, rich_markdown, reply_to, metadata)
+                if rich_result is not None:
+                    if rich_result.success:
+                        try:
+                            await self.send_typing(chat_id, metadata=metadata)
+                        except Exception:
+                            pass  # Typing failures are non-fatal
+                    return rich_result
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
@@ -3390,6 +3550,130 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_kb_actions(
+        self,
+        chat_id: str,
+        text: str,
+        actions: list,
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[str] = None,
+        rich_markdown: Optional[str] = None,
+    ) -> SendResult:
+        """Render a generic KB action card with opaque inline callbacks.
+
+        When ``rich_markdown`` is supplied and rich delivery is eligible
+        (capability present, rich not latched off, content fits the rich cap,
+        no TDesktop details+math crash shape), the card body AND its inline
+        keyboard are delivered as a single Bot API 10.1 ``sendRichMessage``
+        (the spec permits ``reply_markup`` on that endpoint).  On any
+        capability/BadRequest fallback the call degrades transparently to the
+        existing MarkdownV2 keyboard send below — identical to today when
+        ``rich_markdown`` is None.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            from tools import kb_callback_registry as kb_callbacks
+
+            thread_id = self._metadata_thread_id(metadata)
+            rows = []
+            registered_callback_ids: list[str] = []
+            for action in actions or []:
+                label = getattr(action, "label", None)
+                if label is None and isinstance(action, dict):
+                    label = action.get("label")
+                if not label:
+                    continue
+
+                callback_id = getattr(action, "callback_id", None)
+                if callback_id is None and isinstance(action, dict):
+                    callback_id = action.get("callback_id")
+
+                if not callback_id:
+                    handler = getattr(action, "handler", None)
+                    if handler is None and isinstance(action, dict):
+                        handler = action.get("handler")
+                    if not handler:
+                        continue
+                    action_id = getattr(action, "action_id", None)
+                    if action_id is None and isinstance(action, dict):
+                        action_id = action.get("action_id")
+                    action_metadata = getattr(action, "metadata", None)
+                    if action_metadata is None and isinstance(action, dict):
+                        action_metadata = action.get("metadata")
+                    ttl = getattr(action, "ttl", kb_callbacks.DEFAULT_TTL_SECONDS)
+                    if isinstance(action, dict):
+                        ttl = action.get("ttl", ttl)
+                    callback_id = kb_callbacks.register(
+                        str(action_id or label),
+                        handler,
+                        chat_id=str(chat_id),
+                        thread_id=thread_id,
+                        metadata=action_metadata or {},
+                        ttl=float(ttl),
+                    )
+                    registered_callback_ids.append(str(callback_id))
+
+                callback_data = f"kb:{callback_id}"
+                if len(callback_data.encode("utf-8")) > 64:
+                    logger.warning("[%s] Skipping oversized KB callback id", self.name)
+                    if str(callback_id) in registered_callback_ids:
+                        kb_callbacks.clear(str(callback_id))
+                        registered_callback_ids.remove(str(callback_id))
+                    continue
+                button_label = str(label)
+                if len(button_label) > 60:
+                    button_label = button_label[:57] + "..."
+                rows.append([
+                    InlineKeyboardButton(button_label, callback_data=callback_data)
+                ])
+
+            # Bot API 10.1: deliver the card body AND its buttons as a single
+            # native rich message when eligible. The RAW markdown carries
+            # tables/headings/lists that the legacy MarkdownV2 path degrades.
+            # Any capability/permanent rejection returns None and falls through
+            # to the unchanged MarkdownV2 keyboard send below — the registered
+            # callbacks remain valid because the same `rows` keyboard is sent.
+            if rich_markdown and self._rich_eligible(rich_markdown):
+                rich_result = await self._try_send_rich_actions(
+                    chat_id, rich_markdown, rows, reply_to, metadata
+                )
+                if rich_result is not None:
+                    return rich_result
+
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": self.format_message(text),
+                "parse_mode": ParseMode.MARKDOWN_V2,
+                **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
+            }
+            if rows:
+                kwargs["reply_markup"] = InlineKeyboardMarkup(rows)
+
+            reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            try:
+                for callback_id in locals().get("registered_callback_ids", []):
+                    kb_callbacks.clear(str(callback_id))
+            except Exception:
+                pass
+            logger.warning("[%s] send_kb_actions failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -4244,6 +4528,143 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Generic KB action callbacks (kb:callback_id) ---
+        if data.startswith("kb:"):
+            callback_id = data.split(":", 1)[1]
+            if not callback_id:
+                await query.answer(text="Invalid action data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to run this action.")
+                return
+
+            def _kb_callback_send_metadata() -> Dict[str, Any]:
+                thread_id = getattr(query.message, "message_thread_id", None)
+                chat = getattr(query.message, "chat", None)
+                chat_type = getattr(chat, "type", None)
+                prompt_message_id = getattr(query.message, "message_id", None)
+                send_metadata: Dict[str, Any] = {}
+                chat_type_value = getattr(chat_type, "value", chat_type)
+                is_private_chat = str(chat_type_value).lower() in {
+                    "private",
+                    str(ChatType.PRIVATE).lower(),
+                    str(getattr(ChatType.PRIVATE, "value", ChatType.PRIVATE)).lower(),
+                }
+                if thread_id is not None and is_private_chat and prompt_message_id is not None:
+                    reply_to_id = int(prompt_message_id)
+                    send_metadata = {
+                        "thread_id": str(thread_id),
+                        "telegram_dm_topic_reply_fallback": True,
+                        "reply_to_message_id": str(reply_to_id),
+                    }
+                elif thread_id is not None:
+                    send_metadata = {"thread_id": str(thread_id)}
+                return send_metadata
+
+            async def _send_visible_kb_callback_text(text: str) -> None:
+                if not text or not query.message:
+                    return
+                thread_id = getattr(query.message, "message_thread_id", None)
+                send_metadata = _kb_callback_send_metadata()
+                send_kwargs: Dict[str, Any] = {
+                    "chat_id": int(query.message.chat_id),
+                    "text": self.format_message(str(text)),
+                    "parse_mode": ParseMode.MARKDOWN_V2,
+                    **self._link_preview_kwargs(),
+                }
+                reply_to_id = None
+                if send_metadata.get("reply_to_message_id"):
+                    reply_to_id = int(str(send_metadata["reply_to_message_id"]))
+                    send_kwargs["reply_to_message_id"] = reply_to_id
+                send_kwargs.update(
+                    self._thread_kwargs_for_send(
+                        str(query.message.chat_id),
+                        str(thread_id) if thread_id is not None else None,
+                        send_metadata,
+                        reply_to_message_id=reply_to_id,
+                    )
+                )
+                send_kwargs.update(self._notification_kwargs(send_metadata))
+                await self._send_message_with_thread_fallback(**send_kwargs)
+
+            try:
+                from tools import kb_callback_registry as kb_callbacks
+
+                pending = kb_callbacks.get_pending(callback_id)
+                if not pending:
+                    await query.answer(text="Action expired. Use /kb review to refresh.")
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    await _send_visible_kb_callback_text("KB action expired\nUse /kb review to refresh.")
+                    return
+
+                await query.answer(text="Opening KB action...")
+                result = await kb_callbacks.resolve(
+                    callback_id,
+                    actor_id=caller_id,
+                    actor_name=query_user_name,
+                    chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                )
+
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    try:
+                        await query.edit_message_text(
+                            text=getattr(query.message, "text", "") or "Action received.",
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+
+                result_text = result
+                result_actions = []
+                result_rich_markdown: Optional[str] = None
+                if isinstance(result, dict):
+                    result_text = str(result.get("text") or "")
+                    actions_value = result.get("actions")
+                    result_actions = actions_value if isinstance(actions_value, list) else []
+                    rich_value = result.get("rich_markdown")
+                    if isinstance(rich_value, str) and rich_value.strip():
+                        result_rich_markdown = rich_value
+
+                if (result_text or result_actions) and query.message:
+                    if result_actions:
+                        send_result = await self.send_kb_actions(
+                            str(query.message.chat_id),
+                            str(result_text or "KB action"),
+                            result_actions,
+                            metadata=_kb_callback_send_metadata(),
+                            rich_markdown=result_rich_markdown,
+                        )
+                        if not getattr(send_result, "success", False) and result_text:
+                            logger.warning(
+                                "[%s] KB action-card send failed, falling back to text: %s",
+                                self.name,
+                                getattr(send_result, "error", "unknown"),
+                            )
+                            await _send_visible_kb_callback_text(str(result_text))
+                    elif result_text:
+                        await _send_visible_kb_callback_text(str(result_text))
+            except Exception as exc:
+                logger.error("[%s] KB callback failed: %s", self.name, exc, exc_info=True)
+                try:
+                    await query.answer(text="KB action failed. Check gateway logs for details.")
+                except Exception:
+                    pass
             return
 
         # --- Update prompt callbacks ---

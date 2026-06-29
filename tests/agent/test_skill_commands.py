@@ -127,6 +127,25 @@ class TestScanSkillCommands:
         assert "/knowledge-brain" in result
         assert result["/knowledge-brain"]["name"] == "knowledge-brain"
 
+    def test_finds_write_trip_report_in_external_shared_skills_dir(self, tmp_path):
+        """Shared repo skills projected through skills.external_dirs get slash commands."""
+        local_root = tmp_path / "local-skills"
+        external_root = tmp_path / "shared-skills" / "codex-skills"
+        local_root.mkdir()
+        _make_skill(external_root, "write-trip-report", body="Generate a trip report.")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+        ):
+            result = scan_skill_commands()
+
+        assert "/write-trip-report" in result
+        assert result["/write-trip-report"]["name"] == "write-trip-report"
+        assert result["/write-trip-report"]["skill_md_path"].endswith(
+            "codex-skills/write-trip-report/SKILL.md"
+        )
+
     def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
         """Slash commands should load skills symlinked under the local skills dir."""
         external_root = tmp_path / "external"
@@ -396,6 +415,19 @@ class TestResolveSkillCommandKey:
             _make_skill(tmp_path, "claude-code")
             scan_skill_commands()
             assert resolve_skill_command_key("claude_code") == "/claude-code"
+
+    def test_telegram_write_trip_report_form_resolves_to_shared_skill(self, tmp_path):
+        local_root = tmp_path / "local-skills"
+        external_root = tmp_path / "shared-skills" / "codex-skills"
+        local_root.mkdir()
+        _make_skill(external_root, "write-trip-report", body="Generate a trip report.")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+        ):
+            scan_skill_commands()
+            assert resolve_skill_command_key("write_trip_report") == "/write-trip-report"
 
     def test_single_word_command_resolves(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

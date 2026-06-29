@@ -1192,6 +1192,65 @@ class TestRunJobSessionPersistence:
         # But the output log should show the placeholder
         assert "(No response generated)" in output
 
+    def test_run_job_require_tool_call_fails_without_tool_calls(self, tmp_path):
+        """Status watchdogs must not satisfy themselves from stale context."""
+        job = {
+            "id": "watcher-job",
+            "name": "watcher",
+            "prompt": "Check a live workflow run.",
+            "require_tool_call": True,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "[SILENT]",
+                "messages": [
+                    {"role": "user", "content": "Check a live workflow run."},
+                    {"role": "assistant", "content": "[SILENT]"},
+                ],
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "requires at least one tool call" in error
+        assert "requires at least one tool call" in output
+
+    def test_run_job_require_tool_call_accepts_tool_turn(self, tmp_path):
+        job = {
+            "id": "watcher-job",
+            "name": "watcher",
+            "prompt": "Check a live workflow run.",
+            "require_tool_call": True,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "still running",
+                "messages": [
+                    {"role": "user", "content": "Check a live workflow run."},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"function": {"name": "mcp_kb_engine_prod_run_watch"}}],
+                    },
+                    {"role": "tool", "content": "{}"},
+                    {"role": "assistant", "content": "still running"},
+                ],
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "still running"
+        assert error is None
+
     @pytest.mark.parametrize(
         "agent_result,expected_err_substring",
         [
@@ -1897,6 +1956,23 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
+    def test_silent_response_delivers_failure_when_silent_not_ok(self):
+        job = self._make_job()
+        job["silent_ok"] = False
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_called_once()
+        delivered = deliver_mock.call_args.args[1]
+        assert "produced no status update" in delivered
+        mark_mock.assert_called_once()
+        assert mark_mock.call_args.args[1] is False
+        assert "requires a delivered status update" in mark_mock.call_args.args[2]
+
     def test_silent_with_note_suppresses_delivery(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
@@ -1952,6 +2028,101 @@ class TestSilentDelivery:
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
+    def test_recurring_completion_watcher_stops_after_terminal_report(self):
+        job = self._make_job()
+        job.update(
+            {
+                "id": "watcher-job",
+                "name": "KB sync completion watcher gen-test",
+                "prompt": (
+                    "Watch production KB workflow run gen-test. Call run_watch. "
+                    "If terminal, call run_summary and publication_status."
+                ),
+                "schedule": {"kind": "interval", "minutes": 5},
+            }
+        )
+        output = '{"action_posture": "terminal_degraded_report"}'
+        final_response = "KB workflow finished with degradation.\nStatus: completed_with_degradation"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, output, final_response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.update_job", create=True) as update_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        update_mock.assert_called_once()
+        assert update_mock.call_args.args[0] == "watcher-job"
+        assert update_mock.call_args.args[1]["enabled"] is False
+        assert update_mock.call_args.args[1]["state"] == "completed"
+        assert update_mock.call_args.args[1]["next_run_at"] is None
+
+    def test_kb_completion_watcher_stops_after_operator_degradation_receipt(self):
+        job = self._make_job()
+        job.update(
+            {
+                "id": "watcher-job",
+                "name": "KB sync completion watcher gen-0a4abf47b640",
+                "prompt": (
+                    "Watch production KB workflow run gen-0a4abf47b640. "
+                    "Report once when terminal."
+                ),
+                "schedule": {"kind": "interval", "minutes": 5},
+            }
+        )
+        final_response = "\n".join(
+            [
+                "KB workflow completed with degradation.",
+                "",
+                "- Workflow: update_kb",
+                "- Run: gen-0a4abf47b640",
+                "- Status: completed_with_degradation",
+                "- Publication posture: dirty, not pushed",
+            ]
+        )
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# terminal output", final_response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.update_job", create=True) as update_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        update_mock.assert_called_once()
+        assert update_mock.call_args.args[0] == "watcher-job"
+        assert update_mock.call_args.args[1]["enabled"] is False
+        assert update_mock.call_args.args[1]["state"] == "completed"
+        assert update_mock.call_args.args[1]["completed_reason"] == "terminal_workflow_report_delivered"
+
+    def test_recurring_completion_watcher_keeps_running_until_terminal(self):
+        job = self._make_job()
+        job.update(
+            {
+                "id": "watcher-job",
+                "name": "KB sync completion watcher gen-test",
+                "prompt": (
+                    "Watch production KB workflow run gen-test. Call run_watch. "
+                    "If terminal, call run_summary and publication_status."
+                ),
+                "schedule": {"kind": "interval", "minutes": 5},
+            }
+        )
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.update_job", create=True) as update_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        update_mock.assert_not_called()
+
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -2004,6 +2175,18 @@ class TestBuildJobPromptSilentHint:
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
+
+    def test_fail_noisy_contract_for_status_watchers(self):
+        job = {
+            "prompt": "Watch a workflow run.",
+            "silent_ok": False,
+            "require_tool_call": True,
+        }
+        result = _build_job_prompt(job)
+        assert "[JOB CONTRACT:" in result
+        assert "[SILENT] is forbidden" in result
+        assert "call at least one relevant tool" in result
+        assert "Watch a workflow run." in result
 
 
 class TestParseWakeGate:

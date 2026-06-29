@@ -1211,6 +1211,58 @@ class TestTruncateMessage:
             )
 
 
+class TestKbActionsFallback:
+    @pytest.mark.asyncio
+    async def test_default_send_kb_actions_degrades_to_text_labels(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from tools.kb_callback_registry import KbAction
+
+        class StubAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    config=PlatformConfig(enabled=True, token="test"),
+                    platform=Platform.TELEGRAM,
+                )
+                self.sent = None
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent = (chat_id, content, reply_to, metadata)
+                return SendResult(success=True, message_id="m1")
+
+            async def get_chat_info(self, *a):
+                return {}
+
+        async def noop(ctx):
+            return None
+
+        adapter = StubAdapter()
+        result = await adapter.send_kb_actions(
+            chat_id="c1",
+            text="Review this",
+            actions=[
+                KbAction(label="Approve", action_id="approve", handler=noop),
+                KbAction(label="Dismiss", action_id="dismiss", handler=noop),
+            ],
+            metadata={"thread_id": "t1"},
+            reply_to="m0",
+        )
+
+        assert result.success is True
+        assert adapter.sent == (
+            "c1",
+            "Review this\n\nActions: Approve, Dismiss",
+            "m0",
+            {"thread_id": "t1"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # _get_human_delay
 # ---------------------------------------------------------------------------

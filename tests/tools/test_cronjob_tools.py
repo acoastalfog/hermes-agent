@@ -264,6 +264,43 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_workflow_watcher_prompts_default_to_fail_noisy(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "Watch production kb_engine_prod workflow run gen-test. "
+                    "Call run_watch(run_id=\"gen-test\"). "
+                    "If terminal=false, send a concise interim progress line."
+                ),
+                schedule="every 5m",
+                name="Watch KB sync gen-test",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["silent_ok"] is False
+        assert created["job"]["require_tool_call"] is True
+
+    def test_missing_action_reports_action_validation_error(self):
+        result = json.loads(cronjob(action=""))
+
+        assert result["success"] is False
+        assert "action is required" in result["error"]
+
+    def test_explicit_silent_ok_overrides_watcher_inference(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Watch workflow run gen-test and call run_watch.",
+                schedule="every 5m",
+                silent_ok=True,
+                require_tool_call=False,
+            )
+        )
+        assert created["success"] is True
+        assert "silent_ok" not in created["job"]
+        assert "require_tool_call" not in created["job"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -335,6 +372,61 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["model"] == "openai/gpt-4.1"
         assert updated["job"]["provider"] == "openrouter"
         assert updated["job"]["base_url"] is None
+
+    def test_create_normalizes_generic_mcp_toolset_when_unambiguous(self, monkeypatch):
+        from cron.jobs import get_job
+
+        monkeypatch.setattr(
+            "tools.cronjob_tools._configured_mcp_toolset_names",
+            lambda: ["kb_engine_prod"],
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Watch KB sync",
+                schedule="every 5m",
+                enabled_toolsets=["mcp", "terminal", "kb_engine_prod"],
+            )
+        )
+
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["enabled_toolsets"] == ["kb_engine_prod", "terminal"]
+
+    def test_create_rejects_generic_mcp_toolset_when_ambiguous(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.cronjob_tools._configured_mcp_toolset_names",
+            lambda: ["kb_engine_prod", "mcp-kb_engine_prod"],
+        )
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Watch KB sync",
+                schedule="every 5m",
+                enabled_toolsets=["mcp"],
+            )
+        )
+
+        assert result["success"] is False
+        assert "Do not use the generic value 'mcp'" in result["error"]
+        assert "kb_engine_prod" in result["error"]
+
+    def test_update_rejects_unknown_enabled_toolset(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                enabled_toolsets=["not-a-toolset"],
+            )
+        )
+
+        assert updated["success"] is False
+        assert "Unknown enabled_toolsets: not-a-toolset" in updated["error"]
 
     def test_create_skill_backed_job(self):
         result = json.loads(

@@ -863,3 +863,155 @@ async def test_rich_reply_caption_wins_over_lookup(monkeypatch, tmp_path):
         _reply_message("678", reply_caption="echoed caption"), MessageType.TEXT,
     )
     assert event.reply_to_text == "echoed caption"
+
+
+# ---------------------------------------------------------------------------
+# Rich KB command cards: send_kb_actions can deliver the card body AND its
+# inline keyboard in ONE sendRichMessage (Bot API 10.1 permits reply_markup).
+# Falls back to the MarkdownV2 keyboard send when rich is unavailable/oversized.
+# ---------------------------------------------------------------------------
+RICH_CARD_MD = "## KB Status\n\n| Field | Value |\n| --- | --- |\n| Lane | prod |"
+
+
+class _FakeButton:
+    def __init__(self, text, callback_data=None):
+        self.text = text
+        self.callback_data = callback_data
+
+
+class _FakeMarkup:
+    def __init__(self, rows):
+        self.inline_keyboard = rows
+
+    def to_dict(self):
+        return {
+            "inline_keyboard": [
+                [{"text": b.text, "callback_data": b.callback_data} for b in row]
+                for row in self.inline_keyboard
+            ]
+        }
+
+
+def _kb_actions(handler=None):
+    from tools import kb_callback_registry as kb_callbacks
+
+    async def _noop(_ctx):
+        return None
+
+    return [
+        kb_callbacks.KbAction(label="Open", action_id="open", handler=handler or _noop),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_rich_carries_body_and_keyboard_in_one_message():
+    from unittest.mock import patch
+
+    adapter = _make_adapter()
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions(
+            "12345", "*KB Status*", _kb_actions(), rich_markdown=RICH_CARD_MD,
+        )
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    api_kwargs = _rich_api_kwargs(adapter)
+    # PIVOTAL: raw markdown body (NOT MarkdownV2-escaped) AND serialized keyboard
+    # in the SAME sendRichMessage call.
+    assert api_kwargs["rich_message"]["markdown"] == RICH_CARD_MD
+    assert "| Lane | prod |" in api_kwargs["rich_message"]["markdown"]
+    markup = api_kwargs["reply_markup"]
+    assert isinstance(markup, dict)  # serialized to_dict(), not the PTB object
+    row0 = markup["inline_keyboard"][0][0]
+    assert row0["text"] == "Open"
+    assert row0["callback_data"].startswith("kb:")
+    # Legacy MarkdownV2 keyboard send must not run on rich success.
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_without_rich_markdown_uses_legacy_keyboard_path():
+    from unittest.mock import patch
+
+    adapter = _make_adapter()
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions("12345", "*KB Status*", _kb_actions())
+
+    assert result.success is True
+    # Zero-regression pin: no sendRichMessage, legacy MarkdownV2 send used.
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_rich_capability_error_falls_back_to_keyboard():
+    from unittest.mock import AsyncMock, patch
+
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=PTB_ENDPOINT_NOT_FOUND)
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions(
+            "12345", "*KB Status*", _kb_actions(), rich_markdown=RICH_CARD_MD,
+        )
+
+    assert result.success is True
+    # Capability error → rich latched off, buttons still delivered via legacy.
+    adapter._bot.send_message.assert_awaited()
+    assert adapter._rich_send_disabled is True
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_rich_bad_request_falls_back_to_keyboard():
+    from unittest.mock import AsyncMock, patch
+
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=BadRequest("bad rich payload"))
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions(
+            "12345", "*KB Status*", _kb_actions(), rich_markdown=RICH_CARD_MD,
+        )
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited()
+    # BadRequest is a per-message reject, not a capability error: NOT latched.
+    assert adapter._rich_send_disabled is False
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_oversize_rich_skips_to_legacy_keyboard():
+    from unittest.mock import patch
+
+    adapter = _make_adapter()
+    oversize = "## KB\n\n| A | B |\n| --- | --- |\n" + ("| x | y |\n" * 5000)
+    assert len(oversize) > adapter.RICH_MESSAGE_MAX_CHARS
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions(
+            "12345", "*KB*", _kb_actions(), rich_markdown=oversize,
+        )
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_kb_actions_rich_records_sent_body_for_reply_resolution(monkeypatch, tmp_path):
+    from unittest.mock import patch
+    from gateway import rich_sent_store
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_adapter()
+    with patch("gateway.platforms.telegram.InlineKeyboardButton", _FakeButton), \
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _FakeMarkup):
+        result = await adapter.send_kb_actions(
+            "12345", "*KB Status*", _kb_actions(), rich_markdown=RICH_CARD_MD,
+        )
+
+    assert result.success is True
+    # Replies to a rich card must resolve via the sent-body index.
+    assert rich_sent_store.lookup("12345", str(result.message_id)) == RICH_CARD_MD

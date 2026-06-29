@@ -1,0 +1,7 @@
+name: kb_rss_connector
+version: 0.1.0
+description: "Hermes-side RSS evidence connector for kb_sync preview packets. It gathers bounded source evidence only; kb-engine validates, previews, confirms, remembers, and receipts."
+author: "Hermes Agent"
+kind: standalone
+provides_tools:
+  - kb_rss_gather_evidence

@@ -450,7 +450,7 @@ class TestBusySessionAck:
             "max_iterations": 60,
             "current_tool": "terminal",
             "last_activity_ts": time.time(),
-            "last_activity_desc": "terminal",
+            "last_activity_desc": "terminal command running (115s elapsed)",
             "seconds_since_activity": 0.5,
         }
         runner._running_agents[sk] = agent
@@ -463,6 +463,7 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content", "")
         assert "21/60" in content  # iteration
         assert "terminal" in content  # current tool
+        assert "terminal command running" in content  # progress detail
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio

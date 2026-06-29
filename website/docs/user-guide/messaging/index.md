@@ -385,15 +385,15 @@ When the agent running a background session uses `terminal(background=true)` to 
 
 ```yaml
 display:
-  background_process_notifications: all    # all | result | error | off
+  background_process_notifications: result # result | error | off | all
 ```
 
 | Mode | What you receive |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
-| `result` | Only the final completion message (regardless of exit code) |
+| `result` | Only the final completion message (regardless of exit code, default) |
 | `error` | Only the final message when the exit code is non-zero |
 | `off` | No process watcher messages at all |
+| `all` | Running-output updates **and** the final completion message |
 
 You can also set this via environment variable:
 

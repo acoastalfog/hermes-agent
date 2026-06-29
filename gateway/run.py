@@ -497,6 +497,35 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
 
 
+def _agent_activity_status_parts(
+    summary: Dict[str, Any],
+    *,
+    started_at: float = 0,
+    now: float | None = None,
+) -> List[str]:
+    """Build compact operator-facing progress details for a running agent."""
+    now = time.time() if now is None else now
+    status_parts: List[str] = []
+    if started_at:
+        elapsed_min = int((now - started_at) / 60)
+        if elapsed_min > 0:
+            status_parts.append(f"{elapsed_min} min elapsed")
+    iteration = summary.get("api_call_count", 0)
+    max_iter = summary.get("max_iterations", 0)
+    if max_iter:
+        status_parts.append(f"iteration {iteration}/{max_iter}")
+    current_tool = str(summary.get("current_tool") or "").strip()
+    last_desc = str(summary.get("last_activity_desc") or "").strip()
+    if current_tool:
+        detail = f"running: {current_tool}"
+        if last_desc and last_desc.lower() not in {current_tool.lower(), f"executing tool: {current_tool}".lower()}:
+            detail = f"{detail} — {last_desc}"
+        status_parts.append(detail)
+    elif last_desc:
+        status_parts.append(last_desc)
+    return status_parts
+
+
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
 # after a gateway restart when the user's next message starts new work.
@@ -1597,6 +1626,37 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_kb_journeys_plugin_attr(name: str) -> Any:
+    """Resolve an attribute from the active kb_journeys plugin.
+
+    User-installed plugins shadow bundled plugins in Hermes' plugin manager.
+    Gateway runtime code must honor that active plugin instead of importing
+    ``plugins.kb_journeys`` directly, otherwise an external KB plugin can be
+    installed while the gateway still consults the bundled fallback.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        manager = get_plugin_manager()
+        loaded = getattr(manager, "_plugins", {}).get("kb_journeys")
+        module = getattr(loaded, "module", None) if loaded is not None else None
+        if getattr(loaded, "enabled", False) and module is not None:
+            attr = getattr(module, name, None)
+            if attr is not None:
+                return attr
+    except Exception:
+        logger.debug("Failed to resolve kb_journeys from plugin manager", exc_info=True)
+
+    try:
+        from plugins import kb_journeys as bundled_kb_journeys
+
+        return getattr(bundled_kb_journeys, name, None)
+    except Exception:
+        logger.debug("Failed to resolve bundled kb_journeys fallback", exc_info=True)
+        return None
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -3865,7 +3925,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load background process notification mode from config or env var.
 
         Modes:
-          - ``all``    — push running-output updates *and* the final message (default)
+          - ``all``    — push running-output updates *and* the final message
           - ``result`` — only the final completion message (regardless of exit code)
           - ``error``  — only the final message when exit code is non-zero
           - ``off``    — no watcher messages at all
@@ -3878,14 +3938,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mode = "off"
             elif raw not in {None, ""}:
                 mode = str(raw)
-        mode = (mode or "all").strip().lower()
+        mode = (mode or "result").strip().lower()
         valid = {"all", "result", "error", "off"}
         if mode not in valid:
             logger.warning(
-                "Unknown background_process_notifications '%s', defaulting to 'all'",
+                "Unknown background_process_notifications '%s', defaulting to 'result'",
                 mode,
             )
-            return "all"
+            return "result"
         return mode
 
     @staticmethod
@@ -4230,18 +4290,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                status_parts = _agent_activity_status_parts(
+                    summary,
+                    started_at=self._running_agents_ts.get(session_key, 0),
+                    now=now,
+                )
             except Exception:
                 pass
 
@@ -11008,8 +11061,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
+            from hermes_cli.tools_config import (
+                _apply_telegram_mcp_posture_filter,
+                _get_platform_tools,
+            )
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _apply_telegram_mcp_posture_filter(
+                enabled_toolsets,
+                message=prompt,
+                platform=platform_key,
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -13128,9 +13189,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if should_notify:
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
                     message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"Background process finished with exit code {session.exit_code}."
                     )
+                    if new_output:
+                        message_text += f"\nFinal output:\n{new_output}"
                     adapter = None
                     for p, a in self.adapters.items():
                         if p.value == platform_name:
@@ -13153,9 +13215,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
                 message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
+                    f"Background process is still running."
                 )
+                if new_output:
+                    message_text += f"\nNew output:\n{new_output}"
                 adapter = None
                 for p, a in self.adapters.items():
                     if p.value == platform_name:
@@ -14249,8 +14312,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _apply_telegram_mcp_posture_filter,
+            _get_platform_tools,
+        )
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        scoped_mcp_tool_allowlist = set()
+        if platform_key == "telegram":
+            try:
+                resolver = _resolve_kb_journeys_plugin_attr("scoped_mcp_tool_allowlist_for_message")
+                if callable(resolver):
+                    scoped_mcp_tool_allowlist = resolver(
+                        session_id=session_id,
+                        message=message,
+                    )
+            except Exception:
+                logger.debug("Failed to resolve scoped Telegram MCP tool allowlist", exc_info=True)
+        enabled_toolsets = _apply_telegram_mcp_posture_filter(
+            enabled_toolsets,
+            message=message,
+            platform=platform_key,
+            scoped_mcp_tool_allowlist=scoped_mcp_tool_allowlist,
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -16183,14 +16266,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
+                        _parts = _agent_activity_status_parts(_a)
+                        if not _want_iteration_detail:
+                            _parts = [part for part in _parts if not part.startswith("iteration ")]
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:

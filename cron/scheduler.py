@@ -203,12 +203,27 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import advance_next_run, get_due_jobs, mark_job_run, save_job_output, update_job
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_TERMINAL_WORKFLOW_STATUSES = frozenset(
+    {
+        "completed",
+        "completed_with_degradation",
+        "queued_for_review",
+        "published",
+        "failed",
+        "error",
+        "operator_blocked",
+        "cancelled",
+        "skipped_queue_pressure",
+        "stalled_unobserved",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -272,7 +287,6 @@ def _shutdown_parallel_pool() -> None:
 
 atexit.register(_shutdown_parallel_pool)
 
-
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -287,6 +301,57 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _looks_like_completion_watcher(job: dict) -> bool:
+    """Best-effort guard for recurring workflow watcher jobs.
+
+    These jobs are meant to poll until a watched workflow reaches a terminal
+    state. Once they have delivered that terminal report, continuing to poll
+    only repeats the same completion message.
+    """
+    if job.get("stop_after_terminal"):
+        return True
+
+    text = " ".join(
+        str(job.get(key) or "").lower()
+        for key in ("name", "prompt", "script")
+    )
+    if "completion watcher" in text:
+        return True
+    watch_terms = (
+        "run_watch",
+        "run.watch",
+        "run_progress_digest",
+        "run.progress_digest",
+    )
+    if any(term in text for term in watch_terms) and "terminal" in text:
+        return True
+    return "workflow run" in text and "watch" in text and "terminal" in text
+
+
+def _terminal_completion_watcher_report(job: dict, output: str, final_response: str) -> bool:
+    """Return True when a recurring completion watcher has reported terminal state."""
+    schedule = job.get("schedule") or {}
+    if not isinstance(schedule, dict) or schedule.get("kind") not in {"cron", "interval"}:
+        return False
+    if not _looks_like_completion_watcher(job):
+        return False
+
+    text = f"{output or ''}\n{final_response or ''}"
+    if re.search(
+        r'"?action_posture"?\s*:\s*"?terminal[_a-z0-9-]*"?',
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    status_pattern = r"\b(?:terminal\s+status|status)\s*[:=]\s*`?([a-z0-9_ -]+)`?"
+    for match in re.finditer(status_pattern, text, re.IGNORECASE):
+        status = match.group(1).strip().lower().replace(" ", "_").replace("-", "_")
+        if status in _TERMINAL_WORKFLOW_STATUSES:
+            return True
+    return False
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1203,6 +1268,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+    job_contract: list[str] = []
+    if job.get("silent_ok") is False:
+        job_contract.append(
+            "[SILENT] is forbidden for this job: always return a delivered status "
+            "message, even if the status is 'still running' or the watcher cannot inspect state."
+        )
+    if job.get("require_tool_call"):
+        job_contract.append(
+            "You must call at least one relevant tool before your final response; "
+            "do not answer from memory, prior chat context, or the prompt alone."
+        )
+    if job_contract:
+        prompt = "[JOB CONTRACT: " + " ".join(job_contract) + "]\n\n" + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -1935,6 +2013,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             raise RuntimeError(_err_text)
 
+        if job.get("require_tool_call"):
+            messages = result.get("messages") if isinstance(result.get("messages"), list) else []
+            tool_turns = sum(
+                1
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("tool_calls")
+            )
+            if tool_turns < 1:
+                raise RuntimeError(
+                    "cron job requires at least one tool call, but the agent completed "
+                    "without calling tools"
+                )
+
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
@@ -2068,8 +2161,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # empty-response guard below mark the run as a soft failure.
         should_deliver = bool(deliver_content.strip())
         if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-            should_deliver = False
+            if job.get("silent_ok") is False:
+                # Strict watcher contract: a job that opted out of silence
+                # (silent_ok=False) MUST deliver a status update. A [SILENT]
+                # here is a soft failure, not a skip — deliver an explanatory
+                # message and mark the run failed.
+                error = (
+                    "Agent returned [SILENT], but this cron job requires "
+                    "a delivered status update."
+                )
+                success = False
+                deliver_content = (
+                    f"⚠️ Cron job '{job.get('name', job['id'])}' produced no status update.\n\n"
+                    f"{error}\n\n"
+                    "This usually means a watcher prompt did not call the live status tool."
+                )
+                logger.warning("Job '%s': %s", job["id"], error)
+            else:
+                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                should_deliver = False
 
         delivery_error = None
         if should_deliver:
@@ -2086,7 +2196,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # Completion-watcher latching: a recurring watcher that has now
+        # delivered a terminal workflow report should stop polling. Detect
+        # this on the just-delivered output and, after recording the run,
+        # disable the job so it does not repeat the same completion message.
+        complete_recurring_watcher = success and _terminal_completion_watcher_report(
+            job,
+            output,
+            final_response,
+        )
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if complete_recurring_watcher:
+            update_job(
+                job["id"],
+                {
+                    "enabled": False,
+                    "state": "completed",
+                    "next_run_at": None,
+                    "completed_reason": "terminal_workflow_report_delivered",
+                },
+            )
         return True
 
     except Exception as e:

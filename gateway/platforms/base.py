@@ -2315,17 +2315,25 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        rich_markdown: Optional[str] = None,
     ) -> SendResult:
         """
         Send a message to a chat.
-        
+
         Args:
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
             metadata: Additional platform-specific options
-        
+            rich_markdown: OPTIONAL RAW-markdown rendering of the same message
+                body. Platforms that support Bot API 10.1 rich messages
+                (Telegram) may deliver this as a single native rich message so
+                tables / section headings / bullet lists render server-side;
+                every other transport ignores it and sends ``content``
+                unchanged (the legacy contract), so callers — e.g. the
+                action-LESS kb_journeys cards — can pass it unconditionally.
+
         Returns:
             SendResult with success status and message ID
         """
@@ -2508,6 +2516,40 @@ class BasePlatformAdapter(ABC):
         route the callback (e.g. Telegram's ``_approval_state`` dict).
         """
         return SendResult(success=False, error="Not supported")
+
+    async def send_kb_actions(
+        self,
+        chat_id: str,
+        text: str,
+        actions: list,
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[str] = None,
+        rich_markdown: Optional[str] = None,
+    ) -> SendResult:
+        """Send a generic KB action card.
+
+        Platforms with native buttons override this.  The safe default keeps
+        the user-visible content and degrades actions to plain text labels.
+
+        ``rich_markdown`` is an OPTIONAL RAW-markdown rendering of the same
+        card body.  Platforms that support Bot API 10.1 rich messages
+        (Telegram) may deliver the card and its buttons as a single native
+        rich message; the base default ignores it (the legacy ``text`` body is
+        the contract for every other transport), so callers can always pass it
+        unconditionally.
+        """
+        labels: list[str] = []
+        for action in actions or []:
+            label = getattr(action, "label", None)
+            if label is None and isinstance(action, dict):
+                label = action.get("label")
+            if label:
+                labels.append(str(label))
+
+        fallback_text = text
+        if labels:
+            fallback_text = f"{text}\n\nActions: {', '.join(labels)}"
+        return await self.send(chat_id, fallback_text, reply_to=reply_to, metadata=metadata)
 
     async def send_clarify(
         self,

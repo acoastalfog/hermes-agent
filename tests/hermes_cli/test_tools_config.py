@@ -11,6 +11,8 @@ from hermes_cli.tools_config import (
     _apply_toolset_change,
     _checklist_toolset_keys,
     _configure_provider,
+    _apply_telegram_mcp_posture_filter,
+    _telegram_message_requests_commitment_mcp,
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
@@ -25,6 +27,41 @@ from hermes_cli.tools_config import (
     _visible_providers,
     tools_command,
 )
+
+
+def _register_posture_mcp_tools():
+    from tools.registry import registry
+
+    toolset = "mcp-kb_test_posture"
+    tools = [
+        "mcp_kb_test_posture_dashboard_live",
+        "mcp_kb_test_posture_queue_summary",
+        "mcp_kb_test_posture_queue_batch_decide_confirmed",
+        "mcp_kb_test_posture_queue_decide_confirmed",
+        "mcp_kb_test_posture_workflow_start_confirmed",
+        "mcp_kb_test_posture_publication_commit_confirmed",
+        "mcp_kb_test_posture_run_health",
+    ]
+    for name in tools:
+        registry.register(
+            name=name,
+            toolset=toolset,
+            schema={
+                "name": name,
+                "description": f"Test MCP tool {name}",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args: "{}",
+        )
+    registry.register_toolset_alias("kb_test_posture", toolset)
+    return tools
+
+
+def _deregister_posture_mcp_tools(tools):
+    from tools.registry import registry
+
+    for name in tools:
+        registry.deregister(name)
 
 
 def test_agent_disabled_toolsets_suppresses_across_platforms():
@@ -241,6 +278,24 @@ def test_get_platform_tools_expands_composite_when_mixed_with_configurable():
     assert "spotify" in enabled
 
 
+def test_get_platform_tools_expands_composite_after_runtime_toolset_growth():
+    """Runtime-registered tools must not make a composite drop its toolset.
+
+    Importing ``tools.skills_tool`` registers ``skill_status`` under the
+    ``skills`` toolset.  ``hermes-cli`` may not list every future tool, but the
+    platform should still treat the skills toolset as enabled when its core
+    tools are present in the composite.
+    """
+    import tools.skills_tool  # noqa: F401
+
+    config = {"platform_toolsets": {"cli": ["hermes-cli", "spotify"]}}
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert "skills" in enabled
+    assert "spotify" in enabled
+
+
 def test_get_platform_tools_composite_only_unchanged():
     """Composite-only config (no configurable in list) must still take the
     else-branch path and produce the full toolset — guards against the new
@@ -361,6 +416,148 @@ def test_get_platform_tools_includes_enabled_mcp_servers_by_default():
     assert "exa" in enabled
     assert "web-search-prime" in enabled
     assert "disabled-server" not in enabled
+
+
+def test_model_tools_accepts_explicit_tool_entries_for_posture_filters():
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import registry
+
+    name = "posture_direct_tool"
+    registry.register(
+        name=name,
+        toolset="posture_direct_toolset",
+        schema={
+            "name": name,
+            "description": "Directly selected test tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "{}",
+    )
+    try:
+        _clear_tool_defs_cache()
+        defs = get_tool_definitions(enabled_toolsets=[f"tool:{name}"], quiet_mode=True)
+    finally:
+        registry.deregister(name)
+        _clear_tool_defs_cache()
+
+    assert [tool["function"]["name"] for tool in defs] == [name]
+
+
+def test_telegram_ordinary_mcp_posture_keeps_read_context_tools_only():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="what needs my attention today?",
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert "web" in filtered
+    assert "kb_test_posture" not in filtered
+    assert "tool:mcp_kb_test_posture_dashboard_live" in filtered
+    assert "tool:mcp_kb_test_posture_queue_summary" in filtered
+    assert "tool:mcp_kb_test_posture_workflow_start_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_publication_commit_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_run_health" not in filtered
+
+
+def test_telegram_explicit_commitment_mcp_posture_leaves_server_toolset_enabled():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="show KB status and logs before I approve anything",
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert filtered == ["web", "kb_test_posture"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "write a draft email in outlook with this china summary",
+        "Write a draft email with this data in my outlook inbox",
+        "create an Outlook draft from this summary",
+        "draft an email with this",
+        "put this in my Outlook inbox as a draft",
+        "email me the China summary",
+    ],
+)
+def test_telegram_email_draft_requests_count_as_commitment_mcp(message):
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message=message,
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert filtered == ["web", "kb_test_posture"]
+    assert _telegram_message_requests_commitment_mcp(message)
+
+
+def test_telegram_creative_write_request_stays_read_context_only():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="write me a poem about distributed systems",
+            platform="telegram",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert "web" in filtered
+    assert "kb_test_posture" not in filtered
+    assert "tool:mcp_kb_test_posture_dashboard_live" in filtered
+    assert "tool:mcp_kb_test_posture_workflow_start_confirmed" not in filtered
+    assert not _telegram_message_requests_commitment_mcp(
+        "write me a poem about distributed systems"
+    )
+
+
+def test_telegram_pending_action_mcp_posture_exposes_only_scoped_confirmed_tools():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="Reject",
+            platform="telegram",
+            scoped_mcp_tool_allowlist={"mcp_kb_test_posture_queue_batch_decide_confirmed"},
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert "web" in filtered
+    assert "kb_test_posture" not in filtered
+    assert "tool:mcp_kb_test_posture_dashboard_live" in filtered
+    assert "tool:mcp_kb_test_posture_queue_summary" in filtered
+    assert "tool:mcp_kb_test_posture_queue_batch_decide_confirmed" in filtered
+    assert "tool:mcp_kb_test_posture_queue_decide_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_workflow_start_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_publication_commit_confirmed" not in filtered
+    assert "tool:mcp_kb_test_posture_run_health" not in filtered
+
+
+def test_non_telegram_mcp_posture_is_unchanged():
+    tools = _register_posture_mcp_tools()
+    try:
+        filtered = _apply_telegram_mcp_posture_filter(
+            ["web", "kb_test_posture"],
+            message="what needs my attention today?",
+            platform="cli",
+        )
+    finally:
+        _deregister_posture_mcp_tools(tools)
+
+    assert filtered == ["web", "kb_test_posture"]
 
 
 def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_selection():

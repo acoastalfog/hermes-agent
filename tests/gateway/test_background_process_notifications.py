@@ -2,7 +2,7 @@
 
 The gateway process watcher pushes status updates to users' chats when
 background terminal commands run.  ``display.background_process_notifications``
-controls verbosity: off | result | error | all (default).
+controls verbosity: off | result (default) | error | all.
 
 Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
@@ -71,11 +71,11 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
 
 class TestLoadBackgroundNotificationsMode:
 
-    def test_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_defaults_to_result(self, monkeypatch, tmp_path):
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "result"
 
     def test_reads_config_yaml(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
@@ -104,14 +104,14 @@ class TestLoadBackgroundNotificationsMode:
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
         assert GatewayRunner._load_background_notifications_mode() == "off"
 
-    def test_invalid_value_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_invalid_value_defaults_to_result(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
             "display:\n  background_process_notifications: banana\n"
         )
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "result"
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ class TestLoadBackgroundNotificationsMode:
             "result",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Background process finished with exit code 0",
         ),
         # error mode: exit 0 → no notification
         (
@@ -168,14 +168,14 @@ class TestLoadBackgroundNotificationsMode:
             "error",
             [SimpleNamespace(output_buffer="traceback\n", exited=True, exit_code=1)],
             1,
-            "finished with exit code 1",
+            "Background process finished with exit code 1",
         ),
         # all mode: exited → notifies
         (
             "all",
             [SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Background process finished with exit code 0",
         ),
     ],
 )
@@ -202,6 +202,29 @@ async def test_run_process_watcher_respects_notification_mode(
     if expected_fragment is not None:
         sent_message = adapter.send.await_args.args[1]
         assert expected_fragment in sent_message
+
+
+@pytest.mark.asyncio
+async def test_watcher_user_messages_omit_session_id_and_bracket_ceremony(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_secret"))
+
+    sent_message = adapter.send.await_args.args[1]
+    assert sent_message.startswith("Background process finished with exit code 0.")
+    assert "proc_secret" not in sent_message
+    assert not sent_message.startswith("[")
+    assert not sent_message.endswith("]")
 
 
 @pytest.mark.asyncio

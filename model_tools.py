@@ -281,7 +281,10 @@ def get_tool_definitions(
     All tools must be part of a toolset to be accessible.
 
     Args:
-        enabled_toolsets: Only include tools from these toolsets.
+        enabled_toolsets: Only include tools from these toolsets. Entries
+            prefixed with ``tool:`` include one exact tool name; this is used
+            by posture filters that need a narrower slice of a dynamic
+            toolset.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
@@ -367,6 +370,13 @@ def _compute_tool_definitions(
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
+            if isinstance(toolset_name, str) and toolset_name.startswith("tool:"):
+                tool_name = toolset_name[len("tool:"):].strip()
+                if tool_name:
+                    tools_to_include.add(tool_name)
+                    if not quiet_mode:
+                        print(f"✅ Enabled tool '{tool_name}'")
+                continue
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.update(resolved)
@@ -391,6 +401,13 @@ def _compute_tool_definitions(
     # stripped out. See issue #17309.
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
+            if isinstance(toolset_name, str) and toolset_name.startswith("tool:"):
+                tool_name = toolset_name[len("tool:"):].strip()
+                if tool_name:
+                    tools_to_include.discard(tool_name)
+                    if not quiet_mode:
+                        print(f"🚫 Disabled tool '{tool_name}'")
+                continue
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.difference_update(resolved)

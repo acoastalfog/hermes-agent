@@ -115,8 +115,12 @@ class TestProviderSelectionGate:
 
         with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
              patch.object(tt, "_has_local_command", return_value=False), \
-             patch("hermes_cli.config.load_env",
-                   return_value={"XAI_API_KEY": "dotenv-secret"}):
+             patch(
+                 "tools.xai_http.get_env_value",
+                 side_effect=lambda name, default=None: "dotenv-secret"
+                 if name == "XAI_API_KEY"
+                 else default,
+             ):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
 
     def test_explicit_elevenlabs_sees_dotenv(self):
@@ -288,11 +292,15 @@ class TestEndToEndRegressionGuard:
             response.json.return_value = {"text": "ok"}
             return response
 
-        with patch("hermes_cli.config.load_env",
-                   return_value={"XAI_API_KEY": "dotenv-secret"}):
-            # Sanity: get_env_value resolves through load_env when
-            # os.environ is empty.
-            from hermes_cli.config import get_env_value as live_get
+        with patch(
+            "tools.xai_http.get_env_value",
+            side_effect=lambda name, default=None: "dotenv-secret"
+            if name == "XAI_API_KEY"
+            else default,
+        ):
+            # Sanity: xAI credential resolution sees dotenv-only keys through
+            # the direct resolver hook used by transcription providers.
+            from tools.xai_http import get_env_value as live_get
             assert live_get("XAI_API_KEY") == "dotenv-secret"
 
             with patch("requests.post", side_effect=fake_post), \
