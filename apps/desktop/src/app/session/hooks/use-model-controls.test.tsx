@@ -1,5 +1,5 @@
 import { QueryClient } from '@tanstack/react-query'
-import { cleanup, render, renderHook } from '@testing-library/react'
+import { act, cleanup, render, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelInfo } from '@/hermes'
@@ -90,6 +90,25 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('openai/gpt-5.5')
     expect($currentProvider.get()).toBe('openai-codex')
+  })
+
+  it('surfaces a failed model readback instead of leaving an unexplained blank model', async () => {
+    vi.mocked(getGlobalModelInfo).mockRejectedValue(new Error('model endpoint unavailable'))
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        activeSessionId: null,
+        queryClient: new QueryClient(),
+        requestGateway: vi.fn()
+      })
+    )
+
+    await act(async () => {
+      await result.current.refreshCurrentModel()
+    })
+
+    expect($currentModel.get()).toBe('')
+    expect(result.current.modelReadbackError).toContain('model endpoint unavailable')
   })
 
   it('does not clobber the active session footer state with global model info', async () => {

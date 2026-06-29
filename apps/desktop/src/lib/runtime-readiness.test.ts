@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { interpretRuntimeReadiness } from './runtime-readiness'
+import { interpretRuntimeReadiness, resolveDraftSubmissionReadiness } from './runtime-readiness'
 
 describe('interpretRuntimeReadiness', () => {
   it('prefers runtime_check when both signals exist', () => {
@@ -61,5 +61,45 @@ describe('interpretRuntimeReadiness', () => {
     expect(result.ready).toBe(false)
     expect(result.source).toBe('fallback')
     expect(result.reason).toBe('setup.runtime_check timeout')
+  })
+})
+
+describe('resolveDraftSubmissionReadiness', () => {
+  it('fails closed when the gateway transport is open but runtime inference is not ready', () => {
+    const result = resolveDraftSubmissionReadiness({
+      gatewayOpen: true,
+      inferenceStatus: {
+        checksDisagree: false,
+        ready: false,
+        reason: 'No provider can serve the selected model.',
+        source: 'runtime_check'
+      },
+      model: 'gpt-5.5',
+      modelReadbackError: null
+    })
+
+    expect(result).toEqual({
+      ready: false,
+      reason: 'No provider can serve the selected model.'
+    })
+  })
+
+  it('requires an observed model even when runtime inference reports ready', () => {
+    const result = resolveDraftSubmissionReadiness({
+      gatewayOpen: true,
+      inferenceStatus: {
+        checksDisagree: false,
+        ready: true,
+        reason: null,
+        source: 'runtime_check'
+      },
+      model: '',
+      modelReadbackError: 'Configured model readback failed.'
+    })
+
+    expect(result).toEqual({
+      ready: false,
+      reason: 'Configured model readback failed.'
+    })
   })
 })

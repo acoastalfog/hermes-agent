@@ -117,6 +117,27 @@ describe('createBackendSessionForSend profile routing', () => {
 
     expect(params).toMatchObject({ profile: 'default' })
   })
+
+  it('creates exactly one backend session for the first send from a client-only draft', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return {} as never
+    })
+
+    $currentCwd.set('')
+    $activeGatewayProfile.set('default')
+    $newChatProfile.set(null)
+
+    let create: ((preview?: string | null) => Promise<string | null>) | null = null
+    render(<Harness onReady={value => (create = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(create).not.toBeNull())
+
+    await expect(create!('first message')).resolves.toBe(RUNTIME_SESSION_ID)
+    expect(requestGateway.mock.calls.filter(([method]) => method === 'session.create')).toHaveLength(1)
+  })
 })
 
 // ── Resume failure recovery (the "stuck loading session window" bug) ──────────
