@@ -26,9 +26,61 @@ export interface RuntimeReadinessResult {
   source: 'fallback' | 'runtime_check' | 'setup_status'
 }
 
+export interface DraftSubmissionReadinessInput {
+  gatewayOpen: boolean
+  inferenceStatus: RuntimeReadinessResult | null
+  model: string
+  modelReadbackError: string | null
+}
+
+export interface DraftSubmissionReadiness {
+  ready: boolean
+  reason: string | null
+}
+
 export type RuntimeReadinessRequester = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 
 const DEFAULT_NOT_READY_REASON = 'Add a provider credential before sending your first message.'
+
+export function resolveDraftSubmissionReadiness({
+  gatewayOpen,
+  inferenceStatus,
+  model,
+  modelReadbackError
+}: DraftSubmissionReadinessInput): DraftSubmissionReadiness {
+  if (!gatewayOpen) {
+    return {
+      ready: false,
+      reason: 'Hermes gateway is not connected.'
+    }
+  }
+
+  if (modelReadbackError) {
+    return { ready: false, reason: modelReadbackError }
+  }
+
+  if (!model.trim()) {
+    return {
+      ready: false,
+      reason: inferenceStatus?.ready
+        ? 'Configured model was not observed.'
+        : (inferenceStatus?.reason ?? 'Checking model readiness.')
+    }
+  }
+
+  if (!inferenceStatus) {
+    return { ready: false, reason: 'Checking inference readiness.' }
+  }
+
+  if (!inferenceStatus.ready) {
+    return {
+      ready: false,
+      reason: inferenceStatus.reason ?? DEFAULT_NOT_READY_REASON
+    }
+  }
+
+  return { ready: true, reason: null }
+}
 
 function toErrorMessage(error: unknown): null | string {
   if (error instanceof Error) {

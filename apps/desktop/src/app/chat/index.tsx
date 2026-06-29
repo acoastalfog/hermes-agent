@@ -21,6 +21,7 @@ import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import { resolveDraftSubmissionReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -57,6 +58,7 @@ import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert, requestComposerInsertRefs } from './composer/focus'
 import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from './composer/inline-refs'
 import type { ChatBarState } from './composer/types'
+import { DraftTruth } from './draft-truth'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { useFileDropZone } from './hooks/use-file-drop-zone'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
@@ -65,6 +67,8 @@ import { threadLoadingState } from './thread-loading'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
+  inferenceStatus: RuntimeReadinessResult | null
+  modelReadbackError: string | null
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
@@ -96,7 +100,11 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
 
 interface ChatHeaderProps {
   activeSessionId: null | string
+  gatewayOpen: boolean
+  inferenceStatus: RuntimeReadinessResult | null
   isRoutedSessionView: boolean
+  model: string
+  modelReadbackError: string | null
   onDeleteSelectedSession: () => void
   onToggleSelectedPin: () => void
   selectedSessionId: null | string
@@ -104,7 +112,11 @@ interface ChatHeaderProps {
 
 function ChatHeader({
   activeSessionId,
+  gatewayOpen,
+  inferenceStatus,
   isRoutedSessionView,
+  model,
+  modelReadbackError,
   onDeleteSelectedSession,
   onToggleSelectedPin,
   selectedSessionId
@@ -127,10 +139,21 @@ function ChatHeader({
       : false
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
-  // are compact side panels — they drop the session-actions header + border
-  // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isSecondaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  // remain compact. A full-window draft has no session actions yet, so show
+  // transport/model truth in place of the session menu.
+  if (isSecondaryWindow()) {
     return null
+  }
+
+  if (!selectedSessionId && !activeSessionId && !isRoutedSessionView) {
+    return (
+      <DraftTruth
+        gatewayOpen={gatewayOpen}
+        inferenceStatus={inferenceStatus}
+        model={model}
+        modelReadbackError={modelReadbackError}
+      />
+    )
   }
 
   return (
@@ -256,6 +279,8 @@ function ChatRuntimeBoundary({
 export function ChatView({
   className,
   gateway,
+  inferenceStatus,
+  modelReadbackError,
   modelMenuContent,
   onToggleSelectedPin,
   onDeleteSelectedSession,
@@ -362,6 +387,17 @@ export function ChatView({
     [currentModel, currentProvider, modelOptionsQuery.data]
   )
 
+  const draftSubmissionReadiness = useMemo(
+    () =>
+      resolveDraftSubmissionReadiness({
+        gatewayOpen,
+        inferenceStatus,
+        model: currentModel,
+        modelReadbackError
+      }),
+    [currentModel, gatewayOpen, inferenceStatus, modelReadbackError]
+  )
+
   const chatBarState = useMemo<ChatBarState>(
     () => ({
       model: {
@@ -425,7 +461,11 @@ export function ChatView({
       <Backdrop />
       <ChatHeader
         activeSessionId={activeSessionId}
+        gatewayOpen={gatewayOpen}
+        inferenceStatus={inferenceStatus}
         isRoutedSessionView={isRoutedSessionView}
+        model={currentModel}
+        modelReadbackError={modelReadbackError}
         onDeleteSelectedSession={onDeleteSelectedSession}
         onToggleSelectedPin={onToggleSelectedPin}
         selectedSessionId={selectedSessionId}
@@ -483,6 +523,8 @@ export function ChatView({
                 queueSessionKey={selectedSessionId}
                 sessionId={activeSessionId}
                 state={chatBarState}
+                submitBlockedReason={draftSubmissionReadiness.reason}
+                submitDisabled={!draftSubmissionReadiness.ready}
               />
             </Suspense>
           )}
